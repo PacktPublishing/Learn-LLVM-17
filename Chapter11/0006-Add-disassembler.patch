@@ -1,0 +1,153 @@
+From 787815dbeedcd9a28a466706ade9b15ac9cff019 Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai.peter.nacke@ibm.com>
+Date: Wed, 18 Oct 2023 17:27:49 -0400
+Subject: [PATCH 6/6] Add disassembler
+
+---
+ llvm/lib/Target/M88k/CMakeLists.txt           |   1 +
+ .../Target/M88k/Disassembler/CMakeLists.txt   |  13 +++
+ .../M88k/Disassembler/M88kDisassembler.cpp    | 101 ++++++++++++++++++
+ 3 files changed, 115 insertions(+)
+ create mode 100644 llvm/lib/Target/M88k/Disassembler/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/M88k/Disassembler/M88kDisassembler.cpp
+
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+index 068b625225d3..ca2642300ae3 100644
+--- a/llvm/lib/Target/M88k/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -20,5 +20,6 @@ add_llvm_target(M88kCodeGen
+   )
+ 
+ add_subdirectory(AsmParser)
++add_subdirectory(Disassembler)
+ add_subdirectory(TargetInfo)
+ add_subdirectory(MCTargetDesc)
+diff --git a/llvm/lib/Target/M88k/Disassembler/CMakeLists.txt b/llvm/lib/Target/M88k/Disassembler/CMakeLists.txt
+new file mode 100644
+index 000000000000..6f22cfbe8176
+--- /dev/null
++++ b/llvm/lib/Target/M88k/Disassembler/CMakeLists.txt
+@@ -0,0 +1,13 @@
++add_llvm_component_library(LLVMM88kDisassembler
++  M88kDisassembler.cpp
++
++  LINK_COMPONENTS
++  MC
++  MCDisassembler
++  Support
++  M88kDesc
++  M88kInfo
++
++  ADD_TO_COMPONENT
++  M88k
++  )
+diff --git a/llvm/lib/Target/M88k/Disassembler/M88kDisassembler.cpp b/llvm/lib/Target/M88k/Disassembler/M88kDisassembler.cpp
+new file mode 100644
+index 000000000000..f777b33cefd1
+--- /dev/null
++++ b/llvm/lib/Target/M88k/Disassembler/M88kDisassembler.cpp
+@@ -0,0 +1,101 @@
++//===-- M88kDisassembler.cpp - Disassembler for M88k ------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++//#include "M88k.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/MC/MCDecoderOps.h"
++#include "llvm/MC/MCDisassembler/MCDisassembler.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/MathExtras.h"
++#include <cassert>
++#include <cstdint>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "m88k-disassembler"
++
++using DecodeStatus = MCDisassembler::DecodeStatus;
++
++namespace {
++
++class M88kDisassembler : public MCDisassembler {
++public:
++  M88kDisassembler(const MCSubtargetInfo &STI, MCContext &Ctx)
++      : MCDisassembler(STI, Ctx) {}
++  ~M88kDisassembler() override = default;
++
++  DecodeStatus getInstruction(MCInst &instr, uint64_t &Size,
++                              ArrayRef<uint8_t> Bytes, uint64_t Address,
++                              raw_ostream &CStream) const override;
++};
++
++} // end anonymous namespace
++
++static MCDisassembler *createM88kDisassembler(const Target &T,
++                                              const MCSubtargetInfo &STI,
++                                              MCContext &Ctx) {
++  return new M88kDisassembler(STI, Ctx);
++}
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kDisassembler() {
++  // Register the disassembler.
++  TargetRegistry::RegisterMCDisassembler(getTheM88kTarget(),
++                                         createM88kDisassembler);
++}
++
++static const uint16_t GPRDecoderTable[] = {
++    M88k::R0,  M88k::R1,  M88k::R2,  M88k::R3,  M88k::R4,  M88k::R5,
++    M88k::R6,  M88k::R7,  M88k::R8,  M88k::R9,  M88k::R10, M88k::R11,
++    M88k::R12, M88k::R13, M88k::R14, M88k::R15,
++
++    M88k::R16, M88k::R17, M88k::R18, M88k::R19, M88k::R20, M88k::R21,
++    M88k::R22, M88k::R23, M88k::R24, M88k::R25, M88k::R26, M88k::R27,
++    M88k::R28, M88k::R29, M88k::R30, M88k::R31,
++};
++
++static DecodeStatus decodeGPRRegisterClass(MCInst &Inst, uint64_t RegNo,
++                                           uint64_t Address,
++                                           const void *Decoder) {
++  if (RegNo > 31)
++    return MCDisassembler::Fail;
++
++  unsigned Register = GPRDecoderTable[RegNo];
++  Inst.addOperand(MCOperand::createReg(Register));
++  return MCDisassembler::Success;
++}
++
++#include "M88kGenDisassemblerTables.inc"
++
++DecodeStatus M88kDisassembler::getInstruction(MCInst &MI, uint64_t &Size,
++                                              ArrayRef<uint8_t> Bytes,
++                                              uint64_t Address,
++                                              raw_ostream &CS) const {
++  // Instruction size is always 32 bit.
++  if (Bytes.size() < 4) {
++    Size = 0;
++    return MCDisassembler::Fail;
++  }
++  Size = 4;
++
++  // Construct the instruction.
++  uint32_t Inst = 0;
++  for (uint32_t I = 0; I < Size; ++I)
++    Inst = (Inst << 8) | Bytes[I];
++
++  if (decodeInstruction(DecoderTableM88k32, MI, Inst, Address, this, STI) !=
++      MCDisassembler::Success) {
++//    if (STI.getFeatureBits()[M88k::Proc88110])
++//      return decodeInstruction(DecoderTableMC8811032, MI, Inst, Address, this,
++//                               STI);
++    return MCDisassembler::Fail;
++  }
++  return MCDisassembler::Success;
++}
+-- 
+2.40.1
+

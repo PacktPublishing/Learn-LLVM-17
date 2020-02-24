@@ -1,0 +1,183 @@
+diff --git a/llvm/include/llvm/Transforms/PPProfiler/PPProfiler.h b/llvm/include/llvm/Transforms/PPProfiler/PPProfiler.h
+new file mode 100644
+index 000000000000..bda1f9a8f945
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/PPProfiler/PPProfiler.h
+@@ -0,0 +1,20 @@
++#ifndef LLVM_TRANSFORMS_PPPROFILER_PPPROFILER_H
++#define LLVM_TRANSFORMS_PPPROFILER_PPPROFILER_H
++
++#include "llvm/IR/PassManager.h"
++
++namespace llvm {
++class PPProfilerIRPass
++    : public llvm::PassInfoMixin<PPProfilerIRPass> {
++public:
++  llvm::PreservedAnalyses
++  run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
++
++private:
++  void instrument(llvm::Function &F,
++                  llvm::Function *EnterFn,
++                  llvm::Function *ExitFn);
++};
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Passes/CMakeLists.txt b/llvm/lib/Passes/CMakeLists.txt
+index 576d0f3ff442..5529132cb507 100644
+--- a/llvm/lib/Passes/CMakeLists.txt
++++ b/llvm/lib/Passes/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_llvm_component_library(LLVMPasses
+   InstCombine
+   IRPrinter
+   ObjCARC
++  PPProfiler
+   Scalar
+   Support
+   Target
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index a04f8bbaa5dc..3289dc204c5e 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -149,6 +149,7 @@
+ #include "llvm/Transforms/Instrumentation/SanitizerCoverage.h"
+ #include "llvm/Transforms/Instrumentation/ThreadSanitizer.h"
+ #include "llvm/Transforms/ObjCARC.h"
++#include "llvm/Transforms/PPProfiler/PPProfiler.h"
+ #include "llvm/Transforms/Scalar/ADCE.h"
+ #include "llvm/Transforms/Scalar/AlignmentFromAssumptions.h"
+ #include "llvm/Transforms/Scalar/AnnotationRemarks.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 82592a1ee9b5..2dc5e0ed80ae 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -91,6 +91,7 @@ MODULE_PASS("memprof-context-disambiguation", MemProfContextDisambiguation())
+ MODULE_PASS("pgo-icall-prom", PGOIndirectCallPromotion())
+ MODULE_PASS("pgo-instr-gen", PGOInstrumentationGen())
+ MODULE_PASS("pgo-instr-use", PGOInstrumentationUse())
++MODULE_PASS("ppprofiler", PPProfilerIRPass())
+ MODULE_PASS("print-profile-summary", ProfileSummaryPrinterPass(dbgs()))
+ MODULE_PASS("print-callgraph", CallGraphPrinterPass(dbgs()))
+ MODULE_PASS("print-callgraph-sccs", CallGraphSCCsPrinterPass(dbgs()))
+diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
+index dda5f6de11e3..9dad6d8b82af 100644
+--- a/llvm/lib/Transforms/CMakeLists.txt
++++ b/llvm/lib/Transforms/CMakeLists.txt
+@@ -9,3 +9,4 @@ add_subdirectory(Hello)
+ add_subdirectory(ObjCARC)
+ add_subdirectory(Coroutines)
+ add_subdirectory(CFGuard)
++add_subdirectory(PPProfiler)
+diff --git a/llvm/lib/Transforms/PPProfiler/CMakeLists.txt b/llvm/lib/Transforms/PPProfiler/CMakeLists.txt
+new file mode 100644
+index 000000000000..ed5ef10ff528
+--- /dev/null
++++ b/llvm/lib/Transforms/PPProfiler/CMakeLists.txt
+@@ -0,0 +1,7 @@
++add_llvm_component_library(LLVMPPProfiler
++  PPProfiler.cpp
++
++  LINK_COMPONENTS
++  Core
++  Support
++)
+diff --git a/llvm/lib/Transforms/PPProfiler/PPProfiler.cpp b/llvm/lib/Transforms/PPProfiler/PPProfiler.cpp
+new file mode 100644
+index 000000000000..4826809d5187
+--- /dev/null
++++ b/llvm/lib/Transforms/PPProfiler/PPProfiler.cpp
+@@ -0,0 +1,93 @@
++#include "llvm/Transforms/PPProfiler/PPProfiler.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Passes/PassPlugin.h"
++#include "llvm/Support/Debug.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "ppprofiler"
++
++ALWAYS_ENABLED_STATISTIC(
++    NumOfFunc, "Number of instrumented functions.");
++
++void PPProfilerIRPass::instrument(llvm::Function &F,
++                                  Function *EnterFn,
++                                  Function *ExitFn) {
++  ++NumOfFunc;
++
++  // Set the insertion point to begin of first block.
++  IRBuilder<> Builder(&*F.getEntryBlock().begin());
++
++  // Create global constant for the function name.
++  GlobalVariable *FnName =
++      Builder.CreateGlobalString(F.getName());
++
++  // Call the EnterFn at function entry.
++  Builder.CreateCall(EnterFn->getFunctionType(), EnterFn,
++                     {FnName});
++
++  // Find all Ret instructions, and call ExitFn before.
++  for (BasicBlock &BB : F) {
++    for (Instruction &Inst : BB) {
++      if (Inst.getOpcode() == Instruction::Ret) {
++        Builder.SetInsertPoint(&Inst);
++        Builder.CreateCall(ExitFn->getFunctionType(),
++                           ExitFn, {FnName});
++      }
++    }
++  }
++}
++
++PreservedAnalyses
++PPProfilerIRPass::run(Module &M,
++                      ModuleAnalysisManager &AM) {
++  // Do not instrument the runtime functions.
++  if (M.getFunction("__ppp_enter") ||
++      M.getFunction("__ppp_exit")) {
++    return PreservedAnalyses::all();
++  }
++
++  // Create the function type and functions.
++  Type *VoidTy = Type::getVoidTy(M.getContext());
++  PointerType *PtrTy =
++      PointerType::getUnqual(M.getContext());
++  FunctionType *EnterExitFty =
++      FunctionType::get(VoidTy, {PtrTy}, false);
++  Function *EnterFn = Function::Create(
++      EnterExitFty, GlobalValue::ExternalLinkage,
++      "__ppp_enter", M);
++  Function *ExitFn = Function::Create(
++      EnterExitFty, GlobalValue::ExternalLinkage,
++      "__ppp_exit", M);
++
++  // Call enter function.
++  for (auto &F : M.functions()) {
++    if (!F.isDeclaration() && F.hasName())
++      instrument(F, EnterFn, ExitFn);
++  }
++  return PreservedAnalyses::none();
++}
++
++void RegisterCB(PassBuilder &PB) {
++  PB.registerPipelineParsingCallback(
++      [](StringRef Name, ModulePassManager &MPM,
++         ArrayRef<PassBuilder::PipelineElement>) {
++        if (Name == "ppprofiler") {
++          MPM.addPass(PPProfilerIRPass());
++          return true;
++        }
++        return false;
++      });
++  PB.registerPipelineStartEPCallback(
++      [](ModulePassManager &PM, OptimizationLevel Level) {
++        PM.addPass(PPProfilerIRPass());
++      });
++}
++
++llvm::PassPluginLibraryInfo getPPProfilerPluginInfo() {
++  return {LLVM_PLUGIN_API_VERSION, "PPProfiler", "v0.1",
++          RegisterCB};
++}

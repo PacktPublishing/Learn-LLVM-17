@@ -1,0 +1,972 @@
+From 36ef5075668b79e31077ba819edbd41937a714a5 Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai@redstar.de>
+Date: Tue, 26 Dec 2023 18:28:44 -0500
+Subject: [PATCH 8/8] Add GLobalISel
+
+---
+ llvm/lib/Target/M88k/CMakeLists.txt           |   9 +-
+ .../Target/M88k/GISel/M88kCallLowering.cpp    | 145 ++++++++++++++
+ llvm/lib/Target/M88k/GISel/M88kCallLowering.h |  43 ++++
+ .../M88k/GISel/M88kInstructionSelector.cpp    | 163 +++++++++++++++
+ .../Target/M88k/GISel/M88kLegalizerInfo.cpp   |  30 +++
+ .../lib/Target/M88k/GISel/M88kLegalizerInfo.h |  29 +++
+ .../M88k/GISel/M88kRegisterBankInfo.cpp       | 185 ++++++++++++++++++
+ .../Target/M88k/GISel/M88kRegisterBankInfo.h  |  77 ++++++++
+ .../Target/M88k/GISel/M88kRegisterBanks.td    |  15 ++
+ llvm/lib/Target/M88k/M88k.h                   |   6 +
+ llvm/lib/Target/M88k/M88k.td                  |   1 +
+ llvm/lib/Target/M88k/M88kSubtarget.cpp        |  17 +-
+ llvm/lib/Target/M88k/M88kSubtarget.h          |  27 +++
+ llvm/lib/Target/M88k/M88kTargetMachine.cpp    |  31 +++
+ 14 files changed, 776 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kCallLowering.cpp
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kCallLowering.h
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kInstructionSelector.cpp
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.h
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.h
+ create mode 100644 llvm/lib/Target/M88k/GISel/M88kRegisterBanks.td
+
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+index e8091bf3670d..1a446b1165a4 100644
+--- a/llvm/lib/Target/M88k/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -12,9 +12,16 @@ tablegen(LLVM M88kGenMCCodeEmitter.inc -gen-emitter)
+ tablegen(LLVM M88kGenRegisterInfo.inc -gen-register-info)
+ tablegen(LLVM M88kGenSubtargetInfo.inc -gen-subtarget)
+ 
++tablegen(LLVM M88kGenGlobalISel.inc -gen-global-isel)
++tablegen(LLVM M88kGenRegisterBank.inc -gen-register-bank)
++
+ add_public_tablegen_target(M88kCommonTableGen)
+ 
+ add_llvm_target(M88kCodeGen
++  GISel/M88kCallLowering.cpp
++  GISel/M88kInstructionSelector.cpp
++  GISel/M88kLegalizerInfo.cpp
++  GISel/M88kRegisterBankInfo.cpp
+   M88kAsmPrinter.cpp
+   M88kFrameLowering.cpp
+   M88kInstrInfo.cpp
+@@ -37,7 +44,7 @@ add_llvm_target(M88kCodeGen
+   M88kDesc
+   M88kInfo
+   Target
+-#  GlobalISel
++  GlobalISel
+ 
+   ADD_TO_COMPONENT
+   M88k
+diff --git a/llvm/lib/Target/M88k/GISel/M88kCallLowering.cpp b/llvm/lib/Target/M88k/GISel/M88kCallLowering.cpp
+new file mode 100644
+index 000000000000..135217804e97
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kCallLowering.cpp
+@@ -0,0 +1,145 @@
++//===-- M88kCallLowering.cpp - Call lowering --------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++/// \file
++/// This file implements the lowering of LLVM calls to machine code calls for
++/// GlobalISel.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kCallLowering.h"
++#include "M88kISelLowering.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/ADT/ArrayRef.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/CodeGen/CallingConvLower.h"
++#include "llvm/CodeGen/GlobalISel/CallLowering.h"
++#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
++#include "llvm/CodeGen/GlobalISel/Utils.h"
++#include "llvm/CodeGen/LowLevelType.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineMemOperand.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/CodeGen/TargetCallingConv.h"
++#include <cstdint>
++
++using namespace llvm;
++
++// The generated calling convention is included twice.
++#include "M88kGenCallingConv.inc"
++
++M88kCallLowering::M88kCallLowering(const M88kTargetLowering &TLI)
++    : CallLowering(&TLI) {}
++
++namespace {
++
++struct OutgoingArgHandler : public CallLowering::OutgoingValueHandler {
++  OutgoingArgHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI,
++                     MachineInstrBuilder MIB)
++      : OutgoingValueHandler(MIRBuilder, MRI), MIB(MIB) {}
++
++  void assignValueToReg(Register ValVReg, Register PhysReg,
++                        CCValAssign VA) override;
++
++  void assignValueToAddress(Register ValVReg, Register Addr, LLT MemTy,
++                            MachinePointerInfo &MPO,
++                            CCValAssign &VA) override{};
++
++  Register getStackAddress(uint64_t Size, int64_t Offset,
++                           MachinePointerInfo &MPO,
++                           ISD::ArgFlagsTy Flags) override {
++    return Register();
++  };
++
++  MachineInstrBuilder MIB;
++};
++
++struct FormalArgHandler : public CallLowering::IncomingValueHandler {
++  FormalArgHandler(MachineIRBuilder &MIRBuilder, MachineRegisterInfo &MRI)
++      : CallLowering::IncomingValueHandler(MIRBuilder, MRI) {}
++
++  void assignValueToReg(Register ValVReg, Register PhysReg,
++                        CCValAssign VA) override;
++
++  void assignValueToAddress(Register ValVReg, Register Addr, LLT MemTy,
++                            MachinePointerInfo &MPO,
++                            CCValAssign &VA) override{};
++
++  Register getStackAddress(uint64_t Size, int64_t Offset,
++                           MachinePointerInfo &MPO,
++                           ISD::ArgFlagsTy Flags) override {
++    return Register();
++  };
++};
++
++} // namespace
++
++void OutgoingArgHandler::assignValueToReg(Register ValVReg, Register PhysReg,
++                                          CCValAssign VA) {
++  MIB.addUse(PhysReg, RegState::Implicit);
++  Register ExtReg = extendRegister(ValVReg, VA);
++  MIRBuilder.buildCopy(PhysReg, ExtReg);
++}
++
++void FormalArgHandler::assignValueToReg(Register ValVReg, Register PhysReg,
++                                        CCValAssign VA) {
++  MIRBuilder.getMRI()->addLiveIn(PhysReg);
++  MIRBuilder.getMBB().addLiveIn(PhysReg);
++  CallLowering::IncomingValueHandler::assignValueToReg(ValVReg, PhysReg, VA);
++}
++
++bool M88kCallLowering::lowerReturn(MachineIRBuilder &MIRBuilder,
++                                   const Value *Val, ArrayRef<Register> VRegs,
++                                   FunctionLoweringInfo &FLI,
++                                   Register SwiftErrorVReg) const {
++  MachineFunction &MF = MIRBuilder.getMF();
++  const Function &F = MF.getFunction();
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  auto &DL = F.getParent()->getDataLayout();
++
++  auto MIB = MIRBuilder.buildInstrNoInsert(M88k::RET);
++
++  bool Success = true;
++  if (!VRegs.empty()) {
++    SmallVector<ArgInfo, 8> SplitArgs;
++    ArgInfo OrigArg{VRegs, Val->getType(), 0};
++    setArgFlags(OrigArg, AttributeList::ReturnIndex, DL, F);
++    splitToValueTypes(OrigArg, SplitArgs, DL, F.getCallingConv());
++    OutgoingValueAssigner ArgAssigner(RetCC_M88k);
++    OutgoingArgHandler ArgHandler(MIRBuilder, MRI, MIB);
++    Success = determineAndHandleAssignments(ArgHandler, ArgAssigner, SplitArgs,
++                                            MIRBuilder, F.getCallingConv(),
++                                            F.isVarArg());
++  }
++
++  MIRBuilder.insertInstr(MIB);
++  return Success;
++}
++
++bool M88kCallLowering::lowerFormalArguments(MachineIRBuilder &MIRBuilder,
++                                            const Function &F,
++                                            ArrayRef<ArrayRef<Register>> VRegs,
++                                            FunctionLoweringInfo &FLI) const {
++  MachineFunction &MF = MIRBuilder.getMF();
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  const auto &DL = F.getParent()->getDataLayout();
++
++  SmallVector<ArgInfo, 8> SplitArgs;
++  for (const auto &[I, Arg] : llvm::enumerate(F.args())) {
++    ArgInfo OrigArg{VRegs[I], Arg.getType(), static_cast<unsigned>(I)};
++    setArgFlags(OrigArg, I + AttributeList::FirstArgIndex, DL, F);
++    splitToValueTypes(OrigArg, SplitArgs, DL, F.getCallingConv());
++  }
++
++  IncomingValueAssigner ArgAssigner(CC_M88k);
++  FormalArgHandler ArgHandler(MIRBuilder, MRI);
++  return determineAndHandleAssignments(ArgHandler, ArgAssigner, SplitArgs,
++                                       MIRBuilder, F.getCallingConv(),
++                                       F.isVarArg());
++}
+diff --git a/llvm/lib/Target/M88k/GISel/M88kCallLowering.h b/llvm/lib/Target/M88k/GISel/M88kCallLowering.h
+new file mode 100644
+index 000000000000..4a1e6e7ad8ba
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kCallLowering.h
+@@ -0,0 +1,43 @@
++//===-- M88kCallLowering.h - Call lowering ----------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++/// \file
++/// This file implements the lowering of LLVM calls to machine code calls for
++/// GlobalISel.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_GISEL_M88KCALLLOWERING_H
++#define LLVM_LIB_TARGET_M88K_GISEL_M88KCALLLOWERING_H
++
++#include "llvm/ADT/ArrayRef.h"
++#include "llvm/CodeGen/GlobalISel/CallLowering.h"
++#include "llvm/CodeGen/Register.h"
++
++namespace llvm {
++class Value;
++class M88kTargetLowering;
++
++class M88kCallLowering : public CallLowering {
++
++public:
++  M88kCallLowering(const M88kTargetLowering &TLI);
++
++  bool lowerReturn(MachineIRBuilder &MIRBuilder, const Value *Val,
++                   ArrayRef<Register> VRegs, FunctionLoweringInfo &FLI,
++                   Register SwiftErrorVReg) const override;
++
++  bool lowerFormalArguments(MachineIRBuilder &MIRBuilder, const Function &F,
++                            ArrayRef<ArrayRef<Register>> VRegs,
++                            FunctionLoweringInfo &FLI) const override;
++  bool enableBigEndian() const override { return true; }
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_M88K_GISEL_M88KCALLLOWERING_H
+diff --git a/llvm/lib/Target/M88k/GISel/M88kInstructionSelector.cpp b/llvm/lib/Target/M88k/GISel/M88kInstructionSelector.cpp
+new file mode 100644
+index 000000000000..3f28c2ab9532
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kInstructionSelector.cpp
+@@ -0,0 +1,163 @@
++//===- M88kInstructionSelector.cpp ------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// This file implements the targeting of the InstructionSelector class for
++/// M88k.
++/// \todo This should be generated by TableGen.
++//===----------------------------------------------------------------------===//
++
++#include "M88kRegisterBankInfo.h"
++#include "M88kSubtarget.h"
++#include "M88kTargetMachine.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/CodeGen/GlobalISel/GIMatchTableExecutorImpl.h"
++#include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
++#include "llvm/CodeGen/GlobalISel/InstructionSelector.h"
++#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
++#include "llvm/CodeGen/GlobalISel/Utils.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineJumpTableInfo.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/MathExtras.h"
++
++#define DEBUG_TYPE "m88k-isel"
++
++using namespace llvm;
++
++#define GET_GLOBALISEL_PREDICATE_BITSET
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_PREDICATE_BITSET
++
++namespace {
++
++class M88kInstructionSelector : public InstructionSelector {
++public:
++  M88kInstructionSelector(const M88kTargetMachine &TM, const M88kSubtarget &STI,
++                          const M88kRegisterBankInfo &RBI);
++
++  bool select(MachineInstr &I) override;
++  static const char *getName() { return DEBUG_TYPE; }
++
++private:
++  bool selectImpl(MachineInstr &I, CodeGenCoverage &CoverageInfo) const;
++
++
++  [[maybe_unused]] const M88kTargetMachine &TM;
++  const M88kInstrInfo &TII;
++  const M88kRegisterInfo &TRI;
++  const M88kRegisterBankInfo &RBI;
++
++#define GET_GLOBALISEL_PREDICATES_DECL
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_PREDICATES_DECL
++
++#define GET_GLOBALISEL_TEMPORARIES_DECL
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_TEMPORARIES_DECL
++};
++
++} // end anonymous namespace
++
++#define GET_GLOBALISEL_IMPL
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_IMPL
++
++M88kInstructionSelector::M88kInstructionSelector(
++    const M88kTargetMachine &TM, const M88kSubtarget &STI,
++    const M88kRegisterBankInfo &RBI)
++    : InstructionSelector(), TM(TM), TII(*STI.getInstrInfo()),
++      TRI(*STI.getRegisterInfo()), RBI(RBI),
++
++#define GET_GLOBALISEL_PREDICATES_INIT
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_PREDICATES_INIT
++#define GET_GLOBALISEL_TEMPORARIES_INIT
++#include "M88kGenGlobalISel.inc"
++#undef GET_GLOBALISEL_TEMPORARIES_INIT
++{
++}
++
++
++static const TargetRegisterClass *guessRegClass(unsigned Reg,
++                                                MachineRegisterInfo &MRI,
++                                                const TargetRegisterInfo &TRI,
++                                                const RegisterBankInfo &RBI) {
++  const RegisterBank *RegBank = RBI.getRegBank(Reg, MRI, TRI);
++  assert(RegBank && "Can't get reg bank for virtual register");
++
++  const unsigned Size = MRI.getType(Reg).getSizeInBits();
++  assert(RegBank->getID() == M88k::GRRegBankID &&
++         "Unsupported reg bank");
++
++  if (Size == 64)
++    return &M88k::GPR64RegClass;
++  return &M88k::GPRRegClass;
++}
++
++static bool selectCopy(MachineInstr &I, const TargetInstrInfo &TII,
++                       MachineRegisterInfo &MRI, const TargetRegisterInfo &TRI,
++                       const RegisterBankInfo &RBI) {
++  Register SrcReg = I.getOperand(1).getReg();
++  if (Register::isVirtualRegister(SrcReg) &&
++      MRI.getType(SrcReg) == LLT::pointer(0, 32))
++    if (std::optional<APInt> Cst = getIConstantVRegVal(SrcReg, MRI);
++        Cst && Cst->isZero())
++      I.getOperand(1).setReg(M88k::R0);
++
++  Register DstReg = I.getOperand(0).getReg();
++  if (Register::isPhysicalRegister(DstReg))
++    return true;
++
++  const TargetRegisterClass *RC = guessRegClass(DstReg, MRI, TRI, RBI);
++
++  // No need to constrain SrcReg. It will get constrained when
++  // we hit another of its uses or its defs.
++  // Copies do not have constraints.
++  if (!RBI.constrainGenericRegister(DstReg, *RC, MRI)) {
++    LLVM_DEBUG(dbgs() << "Failed to constrain " << TII.getName(I.getOpcode())
++                      << " operand\n");
++    return false;
++  }
++  I.setDesc(TII.get(TargetOpcode::COPY));
++  return true;
++}
++
++
++
++bool M88kInstructionSelector::select(MachineInstr &I) {
++  assert(I.getParent() && "Instruction should be in a basic block!");
++  assert(I.getParent()->getParent() && "Instruction should be in a function!");
++
++  auto &MBB = *I.getParent();
++  auto &MF = *MBB.getParent();
++  auto &MRI = MF.getRegInfo();
++
++  // Certain non-generic instructions also need some special handling.
++  if (!I.isPreISelOpcode()) {
++    if (I.isCopy())
++      return selectCopy(I, TII, MRI, TRI, RBI);
++
++    return true;
++  }
++
++  if (selectImpl(I, *CoverageInfo))
++    return true;
++
++  return false;
++}
++
++namespace llvm {
++InstructionSelector *
++createM88kInstructionSelector(const M88kTargetMachine &TM,
++                              const M88kSubtarget &Subtarget,
++                              const M88kRegisterBankInfo &RBI) {
++  return new M88kInstructionSelector(TM, Subtarget, RBI);
++}
++} // end namespace llvm
+diff --git a/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.cpp b/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.cpp
+new file mode 100644
+index 000000000000..ded97483cbfd
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.cpp
+@@ -0,0 +1,30 @@
++//===-- M88kLegalizerInfo.cpp -----------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// This file implements the targeting of the Machinelegalizer class for M88k.
++//===----------------------------------------------------------------------===//
++
++#include "M88kLegalizerInfo.h"
++#include "M88kInstrInfo.h"
++#include "M88kSubtarget.h"
++#include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
++#include "llvm/CodeGen/LowLevelType.h"
++#include "llvm/CodeGen/TargetOpcodes.h"
++
++using namespace llvm;
++
++M88kLegalizerInfo::M88kLegalizerInfo(const M88kSubtarget &ST) {
++  using namespace TargetOpcode;
++  const LLT S32 = LLT::scalar(32);
++
++  getActionDefinitionsBuilder({G_AND, G_OR, G_XOR})
++      .legalFor({S32})
++      .clampScalar(0, S32, S32);
++
++  getLegacyLegalizerInfo().computeTables();
++}
+diff --git a/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.h b/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.h
+new file mode 100644
+index 000000000000..e889a4e05b6b
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kLegalizerInfo.h
+@@ -0,0 +1,29 @@
++//===- M88kLegalizerInfo -----------------------------------------*- C++ -*-==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// This file declares the targeting of the MachineLegalizer class for
++/// M88k.
++/// \todo This should be generated by TableGen.
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_GISEL_M88KLEGALIZERINFO_H
++#define LLVM_LIB_TARGET_M88K_GISEL_M88KLEGALIZERINFO_H
++
++#include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
++
++namespace llvm {
++
++class M88kSubtarget;
++
++/// This struct provides the information for the target register banks.
++struct M88kLegalizerInfo : public LegalizerInfo {
++public:
++  M88kLegalizerInfo(const M88kSubtarget &ST);
++};
++} // end namespace llvm
++#endif // LLVM_LIB_TARGET_M88K_GISEL_M88KLEGALIZERINFO_H
+diff --git a/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.cpp b/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.cpp
+new file mode 100644
+index 000000000000..7ae27d2c9bea
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.cpp
+@@ -0,0 +1,185 @@
++//===-- M88kRegisterBankInfo.cpp -------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// This file implements the targeting of the RegisterBankInfo class for M88k.
++/// \todo This should be generated by TableGen.
++//===----------------------------------------------------------------------===//
++
++#include "M88kRegisterBankInfo.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
++#include "llvm/CodeGen/LowLevelType.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/CodeGen/RegisterBank.h"
++#include "llvm/CodeGen/TargetOpcodes.h"
++#include "llvm/CodeGen/TargetRegisterInfo.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/Support/ErrorHandling.h"
++#include <cassert>
++
++#define GET_TARGET_REGBANK_IMPL
++#include "M88kGenRegisterBank.inc"
++
++// This file will be TableGen'ed at some point.
++// #include "M88kGenRegisterBankInfo.def"
++
++using namespace llvm;
++
++RegisterBankInfo::PartialMapping M88kGenRegisterBankInfo::PartMappings[]{
++    /* StartIdx, Length, RegBank */
++    // 0: GPR 32-bit value.
++    {0, 32, M88k::GRRegBank},
++    // 1: GPR 64-bit value.
++    {0, 64, M88k::GRRegBank},
++};
++
++// ValueMappings.
++RegisterBankInfo::ValueMapping M88kGenRegisterBankInfo::ValMappings[]{
++    /* BreakDown, NumBreakDowns */
++    // 0: invalid
++    {nullptr, 0},
++    // 3-operands instructions (all binary
++    // operations should end up with one of those
++    // mapping). 1: GR 32-bit value.
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR32], 1},
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR32], 1},
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR32], 1},
++    // 4: 2x GR 32-bit value.
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR64], 1},
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR64], 1},
++    {&M88kGenRegisterBankInfo::PartMappings[PMI_GR64], 1},
++};
++
++const RegisterBankInfo::ValueMapping *
++M88kGenRegisterBankInfo::getValueMapping(PartialMappingIdx RBIdx) {
++  assert(RBIdx != PartialMappingIdx::PMI_None && "No mapping needed for that");
++  return &ValMappings[First3OpsIdx + 3 * RBIdx];
++}
++
++const RegisterBankInfo::ValueMapping *
++M88kGenRegisterBankInfo::getCopyMapping(unsigned DstBankID, unsigned SrcBankID,
++                                        unsigned Size) {
++  assert(DstBankID < M88k::NumRegisterBanks && "Invalid bank ID");
++  assert(SrcBankID < M88k::NumRegisterBanks && "Invalid bank ID");
++
++  if (DstBankID == SrcBankID) {
++    if (DstBankID == M88k::GRRegBankID) {
++      switch (Size) {
++      case 32:
++        return getValueMapping(PMI_GR32);
++      case 64:
++        return getValueMapping(PMI_GR64);
++      default:
++        llvm_unreachable("GR cannot handle that size");
++      }
++    }
++  }
++  llvm_unreachable("Unhandled case");
++}
++
++M88kRegisterBankInfo::M88kRegisterBankInfo(const TargetRegisterInfo &TRI)
++    : M88kGenRegisterBankInfo() {}
++
++const RegisterBank &
++M88kRegisterBankInfo::getRegBankFromRegClass(const TargetRegisterClass &RC,
++                                             LLT Ty) const {
++  switch (RC.getID()) {
++  case M88k::GPRRegClassID:
++  case M88k::GPR64RegClassID:
++    return getRegBank(M88k::GRRegBankID);
++  default:
++    llvm_unreachable("Unexpected register class");
++  }
++}
++
++const RegisterBankInfo::InstructionMapping &
++M88kRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
++  const unsigned Opc = MI.getOpcode();
++
++  // Try the default logic for non-generic instructions
++  // that are either copies or already have some
++  // operands assigned to banks.
++  if ((Opc != TargetOpcode::COPY && !isPreISelGenericOpcode(Opc)) ||
++      Opc == TargetOpcode::G_PHI) {
++    const RegisterBankInfo::InstructionMapping &Mapping =
++        getInstrMappingImpl(MI);
++    if (Mapping.isValid())
++      return Mapping;
++  }
++
++  const MachineFunction &MF = *MI.getParent()->getParent();
++  const MachineRegisterInfo &MRI = MF.getRegInfo();
++  const TargetSubtargetInfo &STI = MF.getSubtarget();
++  const TargetRegisterInfo &TRI = *STI.getRegisterInfo();
++
++  unsigned NumOperands = MI.getNumOperands();
++  const ValueMapping *OperandsMapping = nullptr;
++  unsigned MappingID = DefaultMappingID;
++
++  switch (Opc) {
++    // Bitwise ops.
++  case TargetOpcode::G_AND:
++  case TargetOpcode::G_OR:
++  case TargetOpcode::G_XOR:
++    OperandsMapping = getValueMapping(PMI_GR32);
++    break;
++  case TargetOpcode::G_TRUNC:
++    OperandsMapping = getValueMapping(PMI_GR32);
++    break;
++  case TargetOpcode::G_SEXT:
++  case TargetOpcode::G_ZEXT:
++  case TargetOpcode::G_ANYEXT:
++    OperandsMapping = getValueMapping(PMI_GR32);
++    break;
++  case TargetOpcode::COPY: {
++    Register DstReg = MI.getOperand(0).getReg();
++    Register SrcReg = MI.getOperand(1).getReg();
++    // Check if one of the register is not a generic
++    // register.
++    if ((Register::isPhysicalRegister(DstReg) ||
++         !MRI.getType(DstReg).isValid()) ||
++        (Register::isPhysicalRegister(SrcReg) ||
++         !MRI.getType(SrcReg).isValid())) {
++      const RegisterBank *DstRB = getRegBank(DstReg, MRI, TRI);
++      const RegisterBank *SrcRB = getRegBank(SrcReg, MRI, TRI);
++      if (!DstRB)
++        DstRB = SrcRB;
++      else if (!SrcRB)
++        SrcRB = DstRB;
++      // If both RB are null that means both registers
++      // are generic. We shouldn't be here.
++      assert(DstRB && SrcRB && "Both RegBank were nullptr");
++      unsigned Size = getSizeInBits(DstReg, MRI, TRI);
++      return getInstructionMapping(
++          DefaultMappingID, copyCost(*DstRB, *SrcRB, Size),
++          getCopyMapping(DstRB->getID(), SrcRB->getID(), Size),
++          // We only care about the mapping of the
++          // destination.
++          /*NumOperands*/ 1);
++    }
++    // Both registers are generic, use G_BITCAST.
++    llvm_unreachable("Bitcast not handled");
++  }
++  default:
++#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
++    MI.dump();
++#endif
++    return getInvalidInstructionMapping();
++  }
++
++  return getInstructionMapping(MappingID, /*Cost=*/1, OperandsMapping,
++                               NumOperands);
++}
++
++void M88kRegisterBankInfo::applyMappingImpl(
++    const OperandsMapper &OpdMapper) const {
++  return applyDefaultMapping(OpdMapper);
++}
+diff --git a/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.h b/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.h
+new file mode 100644
+index 000000000000..295ec50cb28d
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kRegisterBankInfo.h
+@@ -0,0 +1,77 @@
++//===-- M88kRegisterBankInfo.h ----------------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// This file declares the targeting of the RegisterBankInfo class for M88k.
++/// \todo This should be generated by TableGen.
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_GISEL_M88KREGISTERBANKINFO_H
++#define LLVM_LIB_TARGET_M88K_GISEL_M88KREGISTERBANKINFO_H
++
++#include "llvm/CodeGen/LowLevelType.h"
++#include "llvm/CodeGen/RegisterBank.h"
++#include "llvm/CodeGen/RegisterBankInfo.h"
++
++#define GET_REGBANK_DECLARATIONS
++#include "M88kGenRegisterBank.inc"
++
++namespace llvm {
++
++class TargetRegisterInfo;
++
++class M88kGenRegisterBankInfo : public RegisterBankInfo {
++protected:
++  enum PartialMappingIdx {
++    PMI_None = -1,
++    PMI_GR32 = 0,
++    PMI_GR64,
++  };
++
++  static RegisterBankInfo::PartialMapping PartMappings[];
++  static RegisterBankInfo::ValueMapping ValMappings[];
++  static PartialMappingIdx BankIDToCopyMapIdx[];
++
++  enum ValueMappingIdx {
++    InvalidIdx = 0,
++    First3OpsIdx = 1,
++  };
++
++  /// Get the pointer to the ValueMapping representing the RegisterBank
++  /// at \p RBIdx.
++  ///
++  /// The returned mapping works for instructions with the same kind of
++  /// operands for up to 3 operands.
++  ///
++  /// \pre \p RBIdx != PartialMappingIdx::None
++  static const RegisterBankInfo::ValueMapping *
++  getValueMapping(PartialMappingIdx RBIdx);
++
++  /// Get the pointer to the ValueMapping of the operands of a copy
++  /// instruction from the \p SrcBankID register bank to the \p DstBankID
++  /// register bank with a size of \p Size.
++  static const RegisterBankInfo::ValueMapping *
++  getCopyMapping(unsigned DstBankID, unsigned SrcBankID, unsigned Size);
++
++#define GET_TARGET_REGBANK_CLASS
++#include "M88kGenRegisterBank.inc"
++};
++
++/// This class provides the information for the target register banks.
++class M88kRegisterBankInfo final : public M88kGenRegisterBankInfo {
++public:
++  M88kRegisterBankInfo(const TargetRegisterInfo &TRI);
++
++  const RegisterBank &getRegBankFromRegClass(const TargetRegisterClass &RC,
++                                             LLT Ty) const override;
++  const InstructionMapping &
++  getInstrMapping(const MachineInstr &MI) const override;
++
++  void applyMappingImpl(const OperandsMapper &OpdMapper) const override;
++};
++} // end namespace llvm
++#endif
+diff --git a/llvm/lib/Target/M88k/GISel/M88kRegisterBanks.td b/llvm/lib/Target/M88k/GISel/M88kRegisterBanks.td
+new file mode 100644
+index 000000000000..7d43f2fbaf95
+--- /dev/null
++++ b/llvm/lib/Target/M88k/GISel/M88kRegisterBanks.td
+@@ -0,0 +1,15 @@
++//===-- M88kRegisterBanks.td - Describe the M88k Banks -------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++///
++/// \file
++/// Define the M88k register banks used for GlobalISel.
++///
++//===----------------------------------------------------------------------===//
++
++/// Register banks.
++def GRRegBank : RegisterBank<"GRRB", [GPR, GPR64]>;
+diff --git a/llvm/lib/Target/M88k/M88k.h b/llvm/lib/Target/M88k/M88k.h
+index a4c88d50db32..bbcae0b88cf3 100644
+--- a/llvm/lib/Target/M88k/M88k.h
++++ b/llvm/lib/Target/M88k/M88k.h
+@@ -17,8 +17,11 @@
+ #include "llvm/Support/CodeGen.h"
+ 
+ namespace llvm {
++class M88kRegisterBankInfo;
++class M88kSubtarget;
+ class M88kTargetMachine;
+ class FunctionPass;
++class InstructionSelector;
+ class PassRegistry;
+ 
+ FunctionPass *createM88kISelDag(M88kTargetMachine &TM,
+@@ -26,5 +29,8 @@ FunctionPass *createM88kISelDag(M88kTargetMachine &TM,
+ 
+ void initializeM88kDAGToDAGISelPass(PassRegistry &);
+ 
++InstructionSelector *
++createM88kInstructionSelector(const M88kTargetMachine &, const M88kSubtarget &,
++                              const M88kRegisterBankInfo &);
+ } // end namespace llvm
+ #endif
+diff --git a/llvm/lib/Target/M88k/M88k.td b/llvm/lib/Target/M88k/M88k.td
+index 2ae740c1fdf9..d0a66cb192fe 100644
+--- a/llvm/lib/Target/M88k/M88k.td
++++ b/llvm/lib/Target/M88k/M88k.td
+@@ -20,6 +20,7 @@ include "llvm/Target/Target.td"
+ //===----------------------------------------------------------------------===//
+ 
+ include "M88kRegisterInfo.td"
++include "GISel/M88kRegisterBanks.td"
+ include "M88kCallingConv.td"
+ include "M88kInstrFormats.td"
+ include "M88kInstrInfo.td"
+diff --git a/llvm/lib/Target/M88k/M88kSubtarget.cpp b/llvm/lib/Target/M88k/M88kSubtarget.cpp
+index 7b05aee25a5c..f2ddbaa2e4eb 100644
+--- a/llvm/lib/Target/M88k/M88kSubtarget.cpp
++++ b/llvm/lib/Target/M88k/M88kSubtarget.cpp
+@@ -11,6 +11,10 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "M88kSubtarget.h"
++#include "M88kTargetMachine.h"
++#include "GISel/M88kCallLowering.h"
++#include "GISel/M88kLegalizerInfo.h"
++#include "GISel/M88kRegisterBankInfo.h"
+ #include "llvm/MC/TargetRegistry.h"
+ #include "llvm/TargetParser/Triple.h"
+ #include <string>
+@@ -32,4 +36,15 @@ M88kSubtarget::M88kSubtarget(const Triple &TT,
+     : M88kGenSubtargetInfo(TT, CPU, /*TuneCPU*/ CPU,
+                            FS),
+       InstrInfo(*this), TLInfo(TM, *this),
+-      FrameLowering() {}
++      FrameLowering() {
++  // GlobalISEL
++  CallLoweringInfo.reset(
++      new M88kCallLowering(*getTargetLowering()));
++  Legalizer.reset(new M88kLegalizerInfo(*this));
++  auto *RBI =
++      new M88kRegisterBankInfo(*getRegisterInfo());
++  RegBankInfo.reset(RBI);
++  InstSelector.reset(createM88kInstructionSelector(
++      *static_cast<const M88kTargetMachine *>(&TM),
++      *this, *RBI));
++}
+diff --git a/llvm/lib/Target/M88k/M88kSubtarget.h b/llvm/lib/Target/M88k/M88kSubtarget.h
+index 4734e2243954..cd9280adeed2 100644
+--- a/llvm/lib/Target/M88k/M88kSubtarget.h
++++ b/llvm/lib/Target/M88k/M88kSubtarget.h
+@@ -17,6 +17,10 @@
+ #include "M88kISelLowering.h"
+ #include "M88kInstrInfo.h"
+ #include "M88kRegisterInfo.h"
++#include "llvm/CodeGen/GlobalISel/CallLowering.h"
++#include "llvm/CodeGen/GlobalISel/InstructionSelector.h"
++#include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
++#include "llvm/CodeGen/RegisterBankInfo.h"
+ #include "llvm/CodeGen/TargetFrameLowering.h"
+ #include "llvm/CodeGen/TargetSubtargetInfo.h"
+ #include "llvm/IR/DataLayout.h"
+@@ -36,6 +40,12 @@ class M88kSubtarget : public M88kGenSubtargetInfo {
+   M88kTargetLowering TLInfo;
+   M88kFrameLowering FrameLowering;
+ 
++  // GlobalISel related APIs.
++  std::unique_ptr<CallLowering> CallLoweringInfo;
++  std::unique_ptr<LegalizerInfo> Legalizer;
++  std::unique_ptr<RegisterBankInfo> RegBankInfo;
++  std::unique_ptr<InstructionSelector> InstSelector;
++
+ public:
+   M88kSubtarget(const Triple &TT,
+                 const std::string &CPU,
+@@ -68,6 +78,23 @@ public:
+   getTargetLowering() const override {
+     return &TLInfo;
+   }
++
++  // GlobalISEL
++  const CallLowering *getCallLowering() const override {
++    return CallLoweringInfo.get();
++  }
++
++  const RegisterBankInfo *getRegBankInfo() const override {
++    return RegBankInfo.get();
++  }
++
++  const LegalizerInfo *getLegalizerInfo() const override {
++    return Legalizer.get();
++  }
++
++  InstructionSelector *getInstructionSelector() const override {
++    return InstSelector.get();
++  }
+ };
+ 
+ } // end namespace llvm
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.cpp b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+index de1249c11a9a..4287a196612f 100644
+--- a/llvm/lib/Target/M88k/M88kTargetMachine.cpp
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+@@ -12,6 +12,10 @@
+ #include "M88kTargetMachine.h"
+ #include "M88k.h"
+ #include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/CodeGen/GlobalISel/IRTranslator.h"
++#include "llvm/CodeGen/GlobalISel/InstructionSelect.h"
++#include "llvm/CodeGen/GlobalISel/Legalizer.h"
++#include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
+ #include "llvm/CodeGen/Passes.h"
+ #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+ #include "llvm/CodeGen/TargetPassConfig.h"
+@@ -120,6 +124,12 @@ public:
+ 
+   bool addInstSelector() override;
+   void addPreEmitPass() override;
++
++  // GlobalISEL
++  bool addIRTranslator() override;
++  bool addLegalizeMachineIR() override;
++  bool addRegBankSelect() override;
++  bool addGlobalInstructionSelect() override;
+ };
+ } // namespace
+ 
+@@ -137,3 +147,24 @@ bool M88kPassConfig::addInstSelector() {
+ void M88kPassConfig::addPreEmitPass() {
+   // TODO Add pass for div-by-zero check.
+ }
++
++// Global ISEL
++bool M88kPassConfig::addIRTranslator() {
++  addPass(new IRTranslator());
++  return false;
++}
++
++bool M88kPassConfig::addLegalizeMachineIR() {
++  addPass(new Legalizer());
++  return false;
++}
++
++bool M88kPassConfig::addRegBankSelect() {
++  addPass(new RegBankSelect());
++  return false;
++}
++
++bool M88kPassConfig::addGlobalInstructionSelect() {
++  addPass(new InstructionSelect(getOptLevel()));
++  return false;
++}
+-- 
+2.40.1
+

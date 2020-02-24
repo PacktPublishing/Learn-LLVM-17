@@ -1,0 +1,8 @@
+MODULE Ptr;
+
+PROCEDURE Set(VAR i: INTEGER);
+BEGIN
+  i := 0;
+END Set;
+
+END Ptr.

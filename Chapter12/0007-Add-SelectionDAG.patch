@@ -1,0 +1,1621 @@
+From 9cba1c2e62a4e504a277402b46f9b74761426ee4 Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai@redstar.de>
+Date: Tue, 24 Oct 2023 07:53:20 -0400
+Subject: [PATCH 7/8] Add SelectionDAG
+
+---
+ llvm/lib/Target/M88k/CMakeLists.txt        |  26 +-
+ llvm/lib/Target/M88k/M88k.h                |  30 ++
+ llvm/lib/Target/M88k/M88k.td               |   1 +
+ llvm/lib/Target/M88k/M88kAsmPrinter.cpp    |  60 ++++
+ llvm/lib/Target/M88k/M88kCallingConv.td    |  36 ++
+ llvm/lib/Target/M88k/M88kFrameLowering.cpp |  33 ++
+ llvm/lib/Target/M88k/M88kFrameLowering.h   |  33 ++
+ llvm/lib/Target/M88k/M88kISelDAGToDAG.cpp  |  67 ++++
+ llvm/lib/Target/M88k/M88kISelLowering.cpp  | 396 +++++++++++++++++++++
+ llvm/lib/Target/M88k/M88kISelLowering.h    |  85 +++++
+ llvm/lib/Target/M88k/M88kInstrFormats.td   |  22 ++
+ llvm/lib/Target/M88k/M88kInstrInfo.cpp     |  64 ++++
+ llvm/lib/Target/M88k/M88kInstrInfo.h       |  50 +++
+ llvm/lib/Target/M88k/M88kInstrInfo.td      |  27 ++
+ llvm/lib/Target/M88k/M88kMCInstLower.cpp   |  40 +++
+ llvm/lib/Target/M88k/M88kMCInstLower.h     |  32 ++
+ llvm/lib/Target/M88k/M88kRegisterInfo.cpp  |  59 +++
+ llvm/lib/Target/M88k/M88kRegisterInfo.h    |  46 +++
+ llvm/lib/Target/M88k/M88kSubtarget.cpp     |  35 ++
+ llvm/lib/Target/M88k/M88kSubtarget.h       |  75 ++++
+ llvm/lib/Target/M88k/M88kTargetMachine.cpp | 128 ++++++-
+ llvm/lib/Target/M88k/M88kTargetMachine.h   |  50 +++
+ 22 files changed, 1391 insertions(+), 4 deletions(-)
+ create mode 100644 llvm/lib/Target/M88k/M88k.h
+ create mode 100644 llvm/lib/Target/M88k/M88kAsmPrinter.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kCallingConv.td
+ create mode 100644 llvm/lib/Target/M88k/M88kFrameLowering.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kFrameLowering.h
+ create mode 100644 llvm/lib/Target/M88k/M88kISelDAGToDAG.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kISelLowering.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kISelLowering.h
+ create mode 100644 llvm/lib/Target/M88k/M88kInstrInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kInstrInfo.h
+ create mode 100644 llvm/lib/Target/M88k/M88kMCInstLower.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kMCInstLower.h
+ create mode 100644 llvm/lib/Target/M88k/M88kRegisterInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kRegisterInfo.h
+ create mode 100644 llvm/lib/Target/M88k/M88kSubtarget.cpp
+ create mode 100644 llvm/lib/Target/M88k/M88kSubtarget.h
+ create mode 100644 llvm/lib/Target/M88k/M88kTargetMachine.h
+
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+index ca2642300ae3..e8091bf3670d 100644
+--- a/llvm/lib/Target/M88k/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -4,17 +4,41 @@ set(LLVM_TARGET_DEFINITIONS M88k.td)
+ 
+ tablegen(LLVM M88kGenAsmMatcher.inc -gen-asm-matcher)
+ tablegen(LLVM M88kGenAsmWriter.inc -gen-asm-writer)
+-tablegen(LLVM M88kGenMCCodeEmitter.inc -gen-emitter)
++tablegen(LLVM M88kGenCallingConv.inc -gen-callingconv)
++tablegen(LLVM M88kGenDAGISel.inc -gen-dag-isel)
+ tablegen(LLVM M88kGenDisassemblerTables.inc -gen-disassembler)
+ tablegen(LLVM M88kGenInstrInfo.inc -gen-instr-info)
++tablegen(LLVM M88kGenMCCodeEmitter.inc -gen-emitter)
+ tablegen(LLVM M88kGenRegisterInfo.inc -gen-register-info)
+ tablegen(LLVM M88kGenSubtargetInfo.inc -gen-subtarget)
+ 
+ add_public_tablegen_target(M88kCommonTableGen)
+ 
+ add_llvm_target(M88kCodeGen
++  M88kAsmPrinter.cpp
++  M88kFrameLowering.cpp
++  M88kInstrInfo.cpp
++  M88kISelDAGToDAG.cpp
++  M88kISelLowering.cpp
++  M88kMCInstLower.cpp
++  M88kRegisterInfo.cpp
++  M88kSubtarget.cpp
+   M88kTargetMachine.cpp
+ 
++  LINK_COMPONENTS
++  Analysis
++  AsmPrinter
++  CodeGen
++  Core
++  MC
++  Scalar
++  SelectionDAG
++  Support
++  M88kDesc
++  M88kInfo
++  Target
++#  GlobalISel
++
+   ADD_TO_COMPONENT
+   M88k
+   )
+diff --git a/llvm/lib/Target/M88k/M88k.h b/llvm/lib/Target/M88k/M88k.h
+new file mode 100644
+index 000000000000..a4c88d50db32
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88k.h
+@@ -0,0 +1,30 @@
++//===-- M88k.h - Top-level interface for M88k representation ----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the entry points for global functions defined in the LLVM
++// M88k back-end.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88K_H
++#define LLVM_LIB_TARGET_M88K_M88K_H
++
++#include "llvm/Support/CodeGen.h"
++
++namespace llvm {
++class M88kTargetMachine;
++class FunctionPass;
++class PassRegistry;
++
++FunctionPass *createM88kISelDag(M88kTargetMachine &TM,
++                                CodeGenOpt::Level OptLevel);
++
++void initializeM88kDAGToDAGISelPass(PassRegistry &);
++
++} // end namespace llvm
++#endif
+diff --git a/llvm/lib/Target/M88k/M88k.td b/llvm/lib/Target/M88k/M88k.td
+index 7ff2db114160..2ae740c1fdf9 100644
+--- a/llvm/lib/Target/M88k/M88k.td
++++ b/llvm/lib/Target/M88k/M88k.td
+@@ -20,6 +20,7 @@ include "llvm/Target/Target.td"
+ //===----------------------------------------------------------------------===//
+ 
+ include "M88kRegisterInfo.td"
++include "M88kCallingConv.td"
+ include "M88kInstrFormats.td"
+ include "M88kInstrInfo.td"
+ 
+diff --git a/llvm/lib/Target/M88k/M88kAsmPrinter.cpp b/llvm/lib/Target/M88k/M88kAsmPrinter.cpp
+new file mode 100644
+index 000000000000..1b795df05f68
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kAsmPrinter.cpp
+@@ -0,0 +1,60 @@
++//===-- M88kAsmPrinter.cpp - M88k LLVM assembly writer ----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains a printer that converts from our internal representation
++// of machine-dependent LLVM code to GAS-format M88k assembly language.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kMCInstLower.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/CodeGen/AsmPrinter.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/MC/MCAsmInfo.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCStreamer.h"
++#include "llvm/MC/TargetRegistry.h"
++#include <memory>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "asm-printer"
++
++namespace {
++class M88kAsmPrinter : public AsmPrinter {
++public:
++  explicit M88kAsmPrinter(
++      TargetMachine &TM,
++      std::unique_ptr<MCStreamer> Streamer)
++      : AsmPrinter(TM, std::move(Streamer)) {}
++
++  StringRef getPassName() const override {
++    return "M88k Assembly Printer";
++  }
++
++  void emitInstruction(const MachineInstr *MI) override;
++};
++} // end of anonymous namespace
++
++void M88kAsmPrinter::emitInstruction(
++    const MachineInstr *MI) {
++  MCInst LoweredMI;
++  M88kMCInstLower Lower;
++  Lower.lower(MI, LoweredMI);
++  EmitToStreamer(*OutStreamer, LoweredMI);
++}
++
++// Force static initialization.
++extern "C" LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeM88kAsmPrinter() {
++  RegisterAsmPrinter<M88kAsmPrinter> X(
++      getTheM88kTarget());
++}
+diff --git a/llvm/lib/Target/M88k/M88kCallingConv.td b/llvm/lib/Target/M88k/M88kCallingConv.td
+new file mode 100644
+index 000000000000..d7bdcf460889
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kCallingConv.td
+@@ -0,0 +1,36 @@
++//===-- M88kCallingConv.td - M88k Calling Conventions ------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This describes the calling conventions for the M88k architectures.
++// Only the OpenBSD variant is supported.
++//
++//===----------------------------------------------------------------------===//
++
++// M88k 32-bit ELF C Calling convention.
++def CC_M88k : CallingConv<[
++  // Promote i8/i16 args to i32.
++  CCIfType<[i8, i16], CCPromoteToType<i32>>,
++
++  // Register R12 is used to pass structure return pointer.
++  CCIfSRet<CCIfType<[i32], CCAssignToReg<[R12]>>>,
++
++  // Registers R2 to R9 are used for passing parameters.
++  CCIfType<[i32,i64,f32,f64], CCAssignToReg<[R2, R3, R4, R5, R6, R7, R8, R9]>>,
++
++  // Other arguments are passed on the stack, at least 4-byte-aligned.
++  CCAssignToStack<4, 4>
++]>;
++
++// M88k 32-bit ELF C return-value convention.
++def RetCC_M88k : CallingConv<[
++  // 32-bit values are returned in R2.
++  CCIfType<[i32], CCAssignToReg<[R2]>>,
++]>;
++
++// M88k 32-bit ELF C callee saved registers.
++def CSR_M88k : CalleeSavedRegs<(add R1, R30, (sequence "R%d", 25, 14))>;
+diff --git a/llvm/lib/Target/M88k/M88kFrameLowering.cpp b/llvm/lib/Target/M88k/M88kFrameLowering.cpp
+new file mode 100644
+index 000000000000..f82428fe4d12
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kFrameLowering.cpp
+@@ -0,0 +1,33 @@
++//===-- M88kFrameLowering.cpp - Frame lowering for M88k -------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kFrameLowering.h"
++#include "M88kRegisterInfo.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineModuleInfo.h"
++#include "llvm/Support/Alignment.h"
++
++using namespace llvm;
++
++M88kFrameLowering::M88kFrameLowering()
++    : TargetFrameLowering(
++          TargetFrameLowering::StackGrowsDown, Align(8),
++          0, Align(8), false /* StackRealignable */) {}
++
++void M88kFrameLowering::emitPrologue(
++    MachineFunction &MF, MachineBasicBlock &MBB) const {
++}
++
++void M88kFrameLowering::emitEpilogue(
++    MachineFunction &MF, MachineBasicBlock &MBB) const {
++}
++
++bool M88kFrameLowering::hasFP(
++    const MachineFunction &MF) const {
++  return false;
++}
+diff --git a/llvm/lib/Target/M88k/M88kFrameLowering.h b/llvm/lib/Target/M88k/M88kFrameLowering.h
+new file mode 100644
+index 000000000000..4d94ace7b180
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kFrameLowering.h
+@@ -0,0 +1,33 @@
++//===-- M88kFrameLowering.h - Frame lowering for M88k -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KFRAMELOWERING_H
++#define LLVM_LIB_TARGET_M88K_M88KFRAMELOWERING_H
++
++#include "llvm/ADT/IndexedMap.h"
++#include "llvm/CodeGen/TargetFrameLowering.h"
++
++namespace llvm {
++class M88kTargetMachine;
++class M88kSubtarget;
++
++class M88kFrameLowering : public TargetFrameLowering {
++public:
++  M88kFrameLowering();
++
++  void
++  emitPrologue(MachineFunction &MF,
++               MachineBasicBlock &MBB) const override;
++  void
++  emitEpilogue(MachineFunction &MF,
++               MachineBasicBlock &MBB) const override;
++  bool hasFP(const MachineFunction &MF) const override;
++};
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/M88kISelDAGToDAG.cpp b/llvm/lib/Target/M88k/M88kISelDAGToDAG.cpp
+new file mode 100644
+index 000000000000..318364334cfd
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kISelDAGToDAG.cpp
+@@ -0,0 +1,67 @@
++//===-- M88kISelDAGToDAG.cpp - A dag to dag inst
++//selector for M88k --------===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines an instruction selector for the
++// M88k target.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88k.h"
++#include "M88kTargetMachine.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/CodeGen/SelectionDAGISel.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/Debug.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "m88k-isel"
++#define PASS_NAME                                      \
++  "M88k DAG->DAG Pattern Instruction Selection"
++
++namespace {
++
++class M88kDAGToDAGISel : public SelectionDAGISel {
++public:
++  static char ID;
++
++  M88kDAGToDAGISel(M88kTargetMachine &TM,
++                   CodeGenOpt::Level OptLevel)
++      : SelectionDAGISel(ID, TM, OptLevel) {}
++
++  // Override SelectionDAGISel.
++  void Select(SDNode *Node) override;
++
++// Include the pieces autogenerated from the target
++// description.
++#include "M88kGenDAGISel.inc"
++};
++} // end anonymous namespace
++
++char M88kDAGToDAGISel::ID = 0;
++
++INITIALIZE_PASS(M88kDAGToDAGISel, DEBUG_TYPE, PASS_NAME,
++                false, false)
++
++FunctionPass *
++llvm::createM88kISelDag(M88kTargetMachine &TM,
++                        CodeGenOpt::Level OptLevel) {
++  return new M88kDAGToDAGISel(TM, OptLevel);
++}
++
++void M88kDAGToDAGISel::Select(SDNode *Node) {
++  // Instruction Selection not handled by the
++  // auto-generated tablegen selection should be handled
++  // here.
++
++  // Select the default instruction.
++  SelectCode(Node);
++}
+diff --git a/llvm/lib/Target/M88k/M88kISelLowering.cpp b/llvm/lib/Target/M88k/M88kISelLowering.cpp
+new file mode 100644
+index 000000000000..140dbc5ccdc9
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kISelLowering.cpp
+@@ -0,0 +1,396 @@
++//===-- M88kISelLowering.cpp - M88k DAG lowering
++// implementation -----===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the M88kTargetLowering class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kISelLowering.h"
++#include "M88kSubtarget.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/CodeGen/CallingConvLower.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include <cstdint>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "m88k-lower"
++
++// If I is a shifted mask, set the size (Width) and the
++// first bit of the mask (Offset), and return true. For
++// example, if I is 0x003e, (Width, Offset) = (5, 1).
++static bool isShiftedMask(uint64_t I, uint64_t &Width,
++                          uint64_t &Offset) {
++  if (!isShiftedMask_64(I))
++    return false;
++
++  Width = llvm::popcount(I);
++  Offset = llvm::countr_zero(I);
++  return true;
++}
++
++M88kTargetLowering::M88kTargetLowering(
++    const TargetMachine &TM, const M88kSubtarget &STI)
++    : TargetLowering(TM), Subtarget(STI) {
++  addRegisterClass(MVT::i32, &M88k::GPRRegClass);
++
++  // Compute derived properties from the register
++  // classes
++  computeRegisterProperties(
++      Subtarget.getRegisterInfo());
++
++  // Set up special registers.
++  setStackPointerRegisterToSaveRestore(M88k::R31);
++
++  // How we extend i1 boolean values.
++  setBooleanContents(ZeroOrOneBooleanContent);
++
++  setMinFunctionAlignment(Align(4));
++  setPrefFunctionAlignment(Align(4));
++
++  setOperationAction(ISD::AND, MVT::i32, Legal);
++  setOperationAction(ISD::OR, MVT::i32, Legal);
++  setOperationAction(ISD::XOR, MVT::i32, Legal);
++
++  setOperationAction(ISD::CTPOP, MVT::i32, Expand);
++
++  // Special DAG combiner for bit-field operations.
++  setTargetDAGCombine(ISD::AND);
++  setTargetDAGCombine(ISD::OR);
++  setTargetDAGCombine(ISD::SHL);
++}
++
++SDValue M88kTargetLowering::LowerOperation(
++    SDValue Op, SelectionDAG &DAG) const {
++  // TODO Implement for ops not covered by patterns in
++  // .td files.
++  /*
++    switch (Op.getOpcode())
++    {
++    case ISD::SHL:          return lowerShiftLeft(Op,
++    DAG);
++    }
++  */
++  return SDValue();
++}
++
++namespace {
++SDValue performANDCombine(
++    SDNode *N, TargetLowering::DAGCombinerInfo &DCI) {
++  SelectionDAG &DAG = DCI.DAG;
++  SDValue FirstOperand = N->getOperand(0);
++  unsigned FirstOperandOpc = FirstOperand.getOpcode();
++  // Second operand of and must be a constant.
++  ConstantSDNode *Mask =
++      dyn_cast<ConstantSDNode>(N->getOperand(1));
++  if (!Mask)
++    return SDValue();
++  EVT ValTy = N->getValueType(0);
++  SDLoc DL(N);
++
++  SDValue NewOperand;
++  unsigned Opc;
++
++  uint64_t Offset;
++  uint64_t MaskWidth, MaskOffset;
++  if (isShiftedMask(Mask->getZExtValue(), MaskWidth,
++                    MaskOffset)) {
++    if (FirstOperandOpc == ISD::SRL ||
++        FirstOperandOpc == ISD::SRA) {
++      // Pattern match:
++      // $dst = and (srl/sra $src, offset), (2**width -
++      // 1)
++      // => EXTU $dst, $src, width<offset>
++
++      // The second operand of the shift must be an
++      // immediate.
++      ConstantSDNode *ShiftAmt =
++          dyn_cast<ConstantSDNode>(
++              FirstOperand.getOperand(1));
++      if (!(ShiftAmt))
++        return SDValue();
++
++      Offset = ShiftAmt->getZExtValue();
++
++      // Return if the shifted mask does not start at
++      // bit 0 or the sum of its width and offset
++      // exceeds the word's size.
++      if (MaskOffset != 0 ||
++          Offset + MaskWidth > ValTy.getSizeInBits())
++        return SDValue();
++
++      Opc = M88kISD::EXTU;
++      NewOperand = FirstOperand.getOperand(0);
++    } else
++      return SDValue();
++  } else if (isShiftedMask(
++                 ~Mask->getZExtValue() &
++                     ((0x1ULL
++                       << ValTy.getSizeInBits()) -
++                      1),
++                 MaskWidth, MaskOffset)) {
++    // Pattern match:
++    // $dst = and $src, ~((2**width - 1) << offset)
++    // => CLR $dst, $src, width<offset>
++    Opc = M88kISD::CLR;
++    NewOperand = FirstOperand;
++    Offset = MaskOffset;
++  } else
++    return SDValue();
++  return DAG.getNode(
++      Opc, DL, ValTy, NewOperand,
++      DAG.getConstant(MaskWidth << 5 | Offset, DL,
++                      MVT::i32));
++}
++
++SDValue
++performORCombine(SDNode *N,
++                 TargetLowering::DAGCombinerInfo &DCI) {
++  SelectionDAG &DAG = DCI.DAG;
++  uint64_t Width, Offset;
++
++  // Second operand of or must be a constant shifted
++  // mask.
++  ConstantSDNode *Mask =
++      dyn_cast<ConstantSDNode>(N->getOperand(1));
++  if (!Mask || !isShiftedMask(Mask->getZExtValue(),
++                              Width, Offset))
++    return SDValue();
++
++  // Pattern match:
++  // $dst = or $src, ((2**width - 1) << offset
++  // => SET $dst, $src, width<offset>
++  EVT ValTy = N->getValueType(0);
++  SDLoc DL(N);
++  return DAG.getNode(
++      M88kISD::SET, DL, ValTy, N->getOperand(0),
++      DAG.getConstant(Width << 5 | Offset, DL,
++                      MVT::i32));
++}
++
++SDValue performSHLCombine(
++    SDNode *N, TargetLowering::DAGCombinerInfo &DCI) {
++  // Pattern match:
++  // $dst = shl (and $src, (2**width - 1)), offset
++  // => MAK $dst, $src, width<offset>
++  SelectionDAG &DAG = DCI.DAG;
++  SDValue FirstOperand = N->getOperand(0);
++  unsigned FirstOperandOpc = FirstOperand.getOpcode();
++  // First operdns shl must be and, second operand must
++  // a constant.
++  ConstantSDNode *ShiftAmt =
++      dyn_cast<ConstantSDNode>(N->getOperand(1));
++  if (!ShiftAmt || FirstOperandOpc != ISD::AND)
++    return SDValue();
++  EVT ValTy = N->getValueType(0);
++  SDLoc DL(N);
++
++  uint64_t Offset;
++  uint64_t MaskWidth, MaskOffset;
++  ConstantSDNode *Mask = dyn_cast<ConstantSDNode>(
++      FirstOperand->getOperand(1));
++  if (!Mask || !isShiftedMask(Mask->getZExtValue(),
++                              MaskWidth, MaskOffset))
++    return SDValue();
++
++  // The second operand of the shift must be an
++  // immediate.
++  Offset = ShiftAmt->getZExtValue();
++
++  // Return if the shifted mask does not start at bit 0
++  // or the sum of its width and offset exceeds the
++  // word's size.
++  if (MaskOffset != 0 ||
++      Offset + MaskWidth > ValTy.getSizeInBits())
++    return SDValue();
++
++  return DAG.getNode(
++      M88kISD::MAK, DL, ValTy,
++      FirstOperand.getOperand(0),
++      DAG.getConstant(MaskWidth << 5 | Offset, DL,
++                      MVT::i32));
++}
++} // namespace
++
++SDValue M88kTargetLowering::PerformDAGCombine(
++    SDNode *N, DAGCombinerInfo &DCI) const {
++  if (DCI.isBeforeLegalizeOps())
++    return SDValue();
++  LLVM_DEBUG(dbgs() << "In PerformDAGCombine\n");
++
++  // TODO: Match certain and/or/shift ops to ext/mak.
++  unsigned Opc = N->getOpcode();
++
++  switch (Opc) {
++  default:
++    break;
++  case ISD::AND:
++    return performANDCombine(N, DCI);
++  case ISD::OR:
++    return performORCombine(N, DCI);
++  case ISD::SHL:
++    return performSHLCombine(N, DCI);
++  }
++
++  return SDValue();
++}
++
++//===----------------------------------------------------------------------===//
++// Calling conventions
++//===----------------------------------------------------------------------===//
++
++#include "M88kGenCallingConv.inc"
++
++SDValue M88kTargetLowering::LowerFormalArguments(
++    SDValue Chain, CallingConv::ID CallConv,
++    bool IsVarArg,
++    const SmallVectorImpl<ISD::InputArg> &Ins,
++    const SDLoc &DL, SelectionDAG &DAG,
++    SmallVectorImpl<SDValue> &InVals) const {
++
++  MachineFunction &MF = DAG.getMachineFunction();
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++
++  // Assign locations to all of the incoming arguments.
++  SmallVector<CCValAssign, 16> ArgLocs;
++  CCState CCInfo(CallConv, IsVarArg, MF, ArgLocs,
++                 *DAG.getContext());
++  CCInfo.AnalyzeFormalArguments(Ins, CC_M88k);
++
++  for (unsigned I = 0, E = ArgLocs.size(); I != E;
++       ++I) {
++    SDValue ArgValue;
++    CCValAssign &VA = ArgLocs[I];
++    EVT LocVT = VA.getLocVT();
++    if (VA.isRegLoc()) {
++      // Arguments passed in registers
++      const TargetRegisterClass *RC;
++      switch (LocVT.getSimpleVT().SimpleTy) {
++      default:
++        // Integers smaller than i64 should be promoted
++        // to i32.
++        llvm_unreachable("Unexpected argument type");
++      case MVT::i32:
++        RC = &M88k::GPRRegClass;
++        break;
++      }
++
++      Register VReg = MRI.createVirtualRegister(RC);
++      MRI.addLiveIn(VA.getLocReg(), VReg);
++      ArgValue =
++          DAG.getCopyFromReg(Chain, DL, VReg, LocVT);
++
++      // If this is an 8/16-bit value, it is really
++      // passed promoted to 32 bits. Insert an
++      // assert[sz]ext to capture this, then truncate to
++      // the right size.
++      if (VA.getLocInfo() == CCValAssign::SExt)
++        ArgValue = DAG.getNode(
++            ISD::AssertSext, DL, LocVT, ArgValue,
++            DAG.getValueType(VA.getValVT()));
++      else if (VA.getLocInfo() == CCValAssign::ZExt)
++        ArgValue = DAG.getNode(
++            ISD::AssertZext, DL, LocVT, ArgValue,
++            DAG.getValueType(VA.getValVT()));
++
++      if (VA.getLocInfo() != CCValAssign::Full)
++        ArgValue = DAG.getNode(ISD::TRUNCATE, DL,
++                               VA.getValVT(), ArgValue);
++
++      InVals.push_back(ArgValue);
++    } else {
++      assert(VA.isMemLoc() &&
++             "Argument not register or memory");
++      llvm_unreachable(
++          "M88k - LowerFormalArguments - "
++          "Memory argument not implemented");
++    }
++  }
++
++  if (IsVarArg) {
++    llvm_unreachable("M88k - LowerFormalArguments - "
++                     "VarArgs not Implemented");
++  }
++
++  return Chain;
++}
++
++SDValue M88kTargetLowering::LowerReturn(
++    SDValue Chain, CallingConv::ID CallConv,
++    bool IsVarArg,
++    const SmallVectorImpl<ISD::OutputArg> &Outs,
++    const SmallVectorImpl<SDValue> &OutVals,
++    const SDLoc &DL, SelectionDAG &DAG) const {
++
++  // Assign locations to each returned value.
++  SmallVector<CCValAssign, 16> RetLocs;
++  CCState RetCCInfo(CallConv, IsVarArg,
++                    DAG.getMachineFunction(), RetLocs,
++                    *DAG.getContext());
++  RetCCInfo.AnalyzeReturn(Outs, RetCC_M88k);
++
++  SDValue Glue;
++  SmallVector<SDValue, 4> RetOps(1, Chain);
++  for (unsigned I = 0, E = RetLocs.size(); I != E;
++       ++I) {
++    CCValAssign &VA = RetLocs[I];
++
++    // Make the return register live on exit.
++    assert(VA.isRegLoc() &&
++           "Can only return in registers!");
++
++    // Chain and glue the copies together.
++    Register Reg = VA.getLocReg();
++    Chain = DAG.getCopyToReg(Chain, DL, Reg, OutVals[I],
++                             Glue);
++    Glue = Chain.getValue(1);
++    RetOps.push_back(
++        DAG.getRegister(Reg, VA.getLocVT()));
++  }
++
++  // Update chain and glue.
++  RetOps[0] = Chain;
++  if (Glue.getNode())
++    RetOps.push_back(Glue);
++
++  return DAG.getNode(M88kISD::RET_GLUE, DL, MVT::Other,
++                     RetOps);
++}
++
++SDValue M88kTargetLowering::LowerCall(
++    CallLoweringInfo &CLI,
++    SmallVectorImpl<SDValue> &InVals) const {
++  llvm_unreachable(
++      "M88k - LowerCall - Not Implemented");
++}
++
++const char *M88kTargetLowering::getTargetNodeName(
++    unsigned Opcode) const {
++  switch (Opcode) {
++#define OPCODE(Opc)                                    \
++  case Opc:                                            \
++    return #Opc
++    OPCODE(M88kISD::RET_GLUE);
++    OPCODE(M88kISD::CALL);
++    OPCODE(M88kISD::CLR);
++    OPCODE(M88kISD::SET);
++    OPCODE(M88kISD::EXT);
++    OPCODE(M88kISD::EXTU);
++    OPCODE(M88kISD::MAK);
++    OPCODE(M88kISD::ROT);
++    OPCODE(M88kISD::FF1);
++    OPCODE(M88kISD::FF0);
++#undef OPCODE
++  default:
++    return nullptr;
++  }
++}
+diff --git a/llvm/lib/Target/M88k/M88kISelLowering.h b/llvm/lib/Target/M88k/M88kISelLowering.h
+new file mode 100644
+index 000000000000..8ceede4f9b6a
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kISelLowering.h
+@@ -0,0 +1,85 @@
++//===-- M88kISelLowering.h - M88k DAG lowering interface --------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines the interfaces that M88k uses to lower LLVM code into a
++// selection DAG.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KISELLOWERING_H
++#define LLVM_LIB_TARGET_M88K_M88KISELLOWERING_H
++
++#include "M88k.h"
++#include "M88kInstrInfo.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/SelectionDAG.h"
++#include "llvm/CodeGen/TargetLowering.h"
++
++namespace llvm {
++
++class M88kSubtarget;
++class M88kSubtarget;
++
++namespace M88kISD {
++enum NodeType : unsigned {
++  FIRST_NUMBER = ISD::BUILTIN_OP_END,
++
++  // Return with a glue operand. Operand 0 is the chain operand.
++  RET_GLUE,
++
++  // Calls a function.  Operand 0 is the chain operand and operand 1
++  // is the target address.  The arguments start at operand 2.
++  // There is an optional glue operand at the end.
++  CALL,
++
++  // Bit-field instructions.
++  CLR,
++  SET,
++  EXT,
++  EXTU,
++  MAK,
++  ROT,
++  FF1,
++  FF0,
++};
++} // end namespace M88kISD
++
++class M88kTargetLowering : public TargetLowering {
++  const M88kSubtarget &Subtarget;
++
++public:
++  explicit M88kTargetLowering(const TargetMachine &TM,
++                              const M88kSubtarget &STI);
++
++  // Override TargetLowering methods.
++  bool hasAndNot(SDValue X) const override { return true; }
++  const char *getTargetNodeName(unsigned Opcode) const override;
++
++  SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
++
++  SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
++
++  // Override required hooks.
++  SDValue LowerFormalArguments(SDValue Chain, CallingConv::ID CallConv,
++                               bool IsVarArg,
++                               const SmallVectorImpl<ISD::InputArg> &Ins,
++                               const SDLoc &DL, SelectionDAG &DAG,
++                               SmallVectorImpl<SDValue> &InVals) const override;
++
++  SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv, bool IsVarArg,
++                      const SmallVectorImpl<ISD::OutputArg> &Outs,
++                      const SmallVectorImpl<SDValue> &OutVals, const SDLoc &DL,
++                      SelectionDAG &DAG) const override;
++
++  SDValue LowerCall(CallLoweringInfo &CLI,
++                    SmallVectorImpl<SDValue> &InVals) const override;
++};
++
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/M88kInstrFormats.td b/llvm/lib/Target/M88k/M88kInstrFormats.td
+index 256b0f82329d..28a8007dad5b 100644
+--- a/llvm/lib/Target/M88k/M88kInstrFormats.td
++++ b/llvm/lib/Target/M88k/M88kInstrFormats.td
+@@ -27,6 +27,13 @@ class InstM88k<dag outs, dag ins, string asm, string operands,
+   let DecoderNamespace = "M88k";
+ }
+ 
++class Pseudo<dag outs, dag ins, list<dag> pattern>
++  : InstM88k<outs, ins, "", "", pattern> {
++  let isCodeGenOnly       = 1;
++  let isPseudo            = 1;
++  let hasNoSchedulingInfo = 1;
++}
++
+ //===----------------------------------------------------------------------===//
+ // The formats follow the categories specified in the User Manual.
+ //===----------------------------------------------------------------------===//
+@@ -52,3 +59,18 @@ class F_LR<bits<5> func, bits<1> comp, string asm, list<dag> pattern = []>
+   let Inst{9-5}   = 0b00000;
+   let Inst{4-0}   = rs2;
+ }
++
++// Category: Flow control.
++
++// Format: JMP/JSR
++class F_JMP<bits<5> func, string asm, list<dag> pattern = []>
++   : InstM88k<(outs), (ins GPROpnd:$rs2), asm, "$rs2", pattern> {
++  bits<5> rs2;
++
++  let Inst{31-26} = 0b111101;
++  let Inst{25-16} = 0b0000000000;
++  let Inst{15-11} = func;
++  let Inst{10}    = hasDelaySlot;
++  let Inst{9-5}   = 0b00000;
++  let Inst{4-0}   = rs2;
++}
+diff --git a/llvm/lib/Target/M88k/M88kInstrInfo.cpp b/llvm/lib/Target/M88k/M88kInstrInfo.cpp
+new file mode 100644
+index 000000000000..6631bcca05ef
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kInstrInfo.cpp
+@@ -0,0 +1,64 @@
++//===-- M88kInstrInfo.cpp - M88k instruction information ------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the M88k implementation of the TargetInstrInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kInstrInfo.h"
++#include "M88kSubtarget.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/CodeGen/LiveIntervals.h"
++#include "llvm/CodeGen/LiveVariables.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineOperand.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
++
++using namespace llvm;
++
++#define GET_INSTRINFO_CTOR_DTOR
++#define GET_INSTRMAP_INFO
++#include "M88kGenInstrInfo.inc"
++
++#define DEBUG_TYPE "m88k-ii"
++
++// Pin the vtable to this file.
++void M88kInstrInfo::anchor() {}
++
++M88kInstrInfo::M88kInstrInfo(M88kSubtarget &STI)
++    : M88kGenInstrInfo(), RI(), STI(STI) {}
++
++bool M88kInstrInfo::expandPostRAPseudo(
++    MachineInstr &MI) const {
++  MachineBasicBlock &MBB = *MI.getParent();
++
++  switch (MI.getOpcode()) {
++  default:
++    return false;
++  case M88k::RET: {
++    MachineInstrBuilder MIB =
++        BuildMI(MBB, &MI, MI.getDebugLoc(),
++                get(M88k::JMP))
++            .addReg(M88k::R1, RegState::Undef);
++
++    // Retain any imp-use flags.
++    for (auto &MO : MI.operands()) {
++      if (MO.isImplicit())
++        MIB.add(MO);
++    }
++    break;
++  }
++  }
++
++  // Erase the pseudo instruction.
++  MBB.erase(MI);
++  return true;
++}
+diff --git a/llvm/lib/Target/M88k/M88kInstrInfo.h b/llvm/lib/Target/M88k/M88kInstrInfo.h
+new file mode 100644
+index 000000000000..9d4333eb101d
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kInstrInfo.h
+@@ -0,0 +1,50 @@
++//===-- M88kInstrInfo.h - M88k instruction information
++//----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the M88k implementation of the
++// TargetInstrInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KINSTRINFO_H
++#define LLVM_LIB_TARGET_M88K_M88KINSTRINFO_H
++
++#include "M88kRegisterInfo.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++
++#define GET_INSTRINFO_HEADER
++#include "M88kGenInstrInfo.inc"
++
++namespace llvm {
++
++class M88kSubtarget;
++
++class M88kInstrInfo : public M88kGenInstrInfo {
++  const M88kRegisterInfo RI;
++  [[maybe_unused]] M88kSubtarget &STI;
++
++  virtual void anchor();
++
++public:
++  explicit M88kInstrInfo(M88kSubtarget &STI);
++
++  // Return the M88kRegisterInfo, which this class owns.
++  const M88kRegisterInfo &getRegisterInfo() const {
++    return RI;
++  }
++
++  bool
++  expandPostRAPseudo(MachineInstr &MI) const override;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_M88K_M88KINSTRINFO_H
+diff --git a/llvm/lib/Target/M88k/M88kInstrInfo.td b/llvm/lib/Target/M88k/M88kInstrInfo.td
+index d7e8a66822a6..ebaaf438a0bb 100644
+--- a/llvm/lib/Target/M88k/M88kInstrInfo.td
++++ b/llvm/lib/Target/M88k/M88kInstrInfo.td
+@@ -10,6 +10,25 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++// ---------------------------------------------------------------------------//
++// Selection DAG Nodes.
++// ---------------------------------------------------------------------------//
++
++// Selection DAG types.
++
++// These are target-independent nodes, but have target-specific formats.
++def SDT_CallSeqStart : SDCallSeqStart<[SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
++def SDT_CallSeqEnd   : SDCallSeqEnd<[SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
++def SDT_Call         : SDTypeProfile<0, -1, [SDTCisPtrTy<0>]>;
++
++// Selection DAG nodes.
++
++def call             : SDNode<"M88kISD::CALL", SDT_Call,
++                              [SDNPHasChain, SDNPOptInGlue, SDNPOutGlue,
++                              SDNPVariadic]>;
++def retglue          : SDNode<"M88kISD::RET_GLUE", SDTNone,
++                              [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
++
+ // ---------------------------------------------------------------------------//
+ // Logic and bit field instructions.
+ // ---------------------------------------------------------------------------//
+@@ -26,3 +45,11 @@ multiclass Logic<bits<5> Func, string OpcStr, SDNode OpNode> {
+ defm AND : Logic<0b01000, "and", and>;
+ defm XOR : Logic<0b01010, "xor", xor>;
+ defm OR  : Logic<0b01011, "or", or>;
++
++let isBarrier = 1, isBranch = 1, isTerminator = 1, isIndirectBranch = 1 in {
++  def JMP : F_JMP<0b11000, "jmp", [(brind GPROpnd:$rs2)]>;
++}
++
++let isReturn = 1, isTerminator = 1, isBarrier = 1,
++    AsmString = "RET" in
++  def RET : Pseudo<(outs), (ins), [(retglue)]>;
+diff --git a/llvm/lib/Target/M88k/M88kMCInstLower.cpp b/llvm/lib/Target/M88k/M88kMCInstLower.cpp
+new file mode 100644
+index 000000000000..64273c4e7c09
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kMCInstLower.cpp
+@@ -0,0 +1,40 @@
++//===-- M88kMCInstLower.cpp - Lower MachineInstr to MCInst ----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kMCInstLower.h"
++#include "llvm/CodeGen/AsmPrinter.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineOperand.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCStreamer.h"
++
++using namespace llvm;
++
++MCOperand M88kMCInstLower::lowerOperand(
++    const MachineOperand &MO) const {
++  switch (MO.getType()) {
++  case MachineOperand::MO_Register:
++    return MCOperand::createReg(MO.getReg());
++
++  case MachineOperand::MO_Immediate:
++    return MCOperand::createImm(MO.getImm());
++
++  default:
++    llvm_unreachable("Operand type not handled");
++  }
++}
++
++void M88kMCInstLower::lower(const MachineInstr *MI,
++                            MCInst &OutMI) const {
++  OutMI.setOpcode(MI->getOpcode());
++  for (auto &MO : MI->operands()) {
++    // Ignore all implicit register operands.
++    if (!MO.isReg() || !MO.isImplicit())
++      OutMI.addOperand(lowerOperand(MO));
++  }
++}
+diff --git a/llvm/lib/Target/M88k/M88kMCInstLower.h b/llvm/lib/Target/M88k/M88kMCInstLower.h
+new file mode 100644
+index 000000000000..f05bbea14b1e
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kMCInstLower.h
+@@ -0,0 +1,32 @@
++//===-- M88kMCInstLower.h - Lower MachineInstr to MCInst -------*- C++ -*--===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KMCINSTLOWER_H
++#define LLVM_LIB_TARGET_M88K_M88KMCINSTLOWER_H
++
++#include "llvm/Support/Compiler.h"
++
++namespace llvm {
++class AsmPrinter;
++class MCInst;
++class MCOperand;
++class MachineInstr;
++class MachineOperand;
++class Mangler;
++
++class LLVM_LIBRARY_VISIBILITY M88kMCInstLower {
++public:
++  // Lower MachineInstr MI to MCInst OutMI.
++  void lower(const MachineInstr *MI, MCInst &OutMI) const;
++
++  // Return an MCOperand for MO.
++  MCOperand lowerOperand(const MachineOperand &MO) const;
++};
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/M88kRegisterInfo.cpp b/llvm/lib/Target/M88k/M88kRegisterInfo.cpp
+new file mode 100644
+index 000000000000..9f33062916ce
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kRegisterInfo.cpp
+@@ -0,0 +1,59 @@
++//===-- M88kRegisterInfo.cpp - M88k Register Information
++//------------------===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the M88k implementation of the
++// TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kRegisterInfo.h"
++#include "M88kFrameLowering.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/ADT/BitVector.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++#include "llvm/MC/MCRegister.h"
++
++using namespace llvm;
++
++#define GET_REGINFO_TARGET_DESC
++#include "M88kGenRegisterInfo.inc"
++
++M88kRegisterInfo::M88kRegisterInfo()
++    : M88kGenRegisterInfo(M88k::R1) {}
++
++const MCPhysReg *M88kRegisterInfo::getCalleeSavedRegs(
++    const MachineFunction *MF) const {
++  return CSR_M88k_SaveList;
++}
++
++BitVector M88kRegisterInfo::getReservedRegs(
++    const MachineFunction &MF) const {
++  BitVector Reserved(getNumRegs());
++
++  // R31 is the stack pointer.
++  Reserved.set(M88k::R31);
++
++  return Reserved;
++}
++
++bool M88kRegisterInfo::eliminateFrameIndex(
++    MachineBasicBlock::iterator MI, int SPAdj,
++    unsigned FIOperandNum, RegScavenger *RS) const {
++  return false;
++}
++
++Register M88kRegisterInfo::getFrameRegister(
++    const MachineFunction &MF) const {
++  return M88k::R30;
++}
+diff --git a/llvm/lib/Target/M88k/M88kRegisterInfo.h b/llvm/lib/Target/M88k/M88kRegisterInfo.h
+new file mode 100644
+index 000000000000..eacaf0e4a6b9
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kRegisterInfo.h
+@@ -0,0 +1,46 @@
++//===-- M88kRegisterInfo.h - M88k Register Information
++//Impl -----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the M88k implementation of the
++// TargetRegisterInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KREGISTERINFO_H
++#define LLVM_LIB_TARGET_M88K_M88KREGISTERINFO_H
++
++#define GET_REGINFO_HEADER
++#include "M88kGenRegisterInfo.inc"
++
++namespace llvm {
++
++struct M88kRegisterInfo : public M88kGenRegisterInfo {
++  M88kRegisterInfo();
++
++  /// Code Generation virtual methods...
++  const MCPhysReg *getCalleeSavedRegs(
++      const MachineFunction *MF) const override;
++
++  BitVector getReservedRegs(
++      const MachineFunction &MF) const override;
++
++  bool eliminateFrameIndex(
++      MachineBasicBlock::iterator II, int SPAdj,
++      unsigned FIOperandNum,
++      RegScavenger *RS = nullptr) const override;
++
++  Register getFrameRegister(
++      const MachineFunction &MF) const override;
++};
++
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/M88kSubtarget.cpp b/llvm/lib/Target/M88k/M88kSubtarget.cpp
+new file mode 100644
+index 000000000000..7b05aee25a5c
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kSubtarget.cpp
+@@ -0,0 +1,35 @@
++//===-- M88kSubtarget.cpp - M88k Subtarget Information ----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the M88k specific subclass of TargetSubtargetInfo.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kSubtarget.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/TargetParser/Triple.h"
++#include <string>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "m88k-subtarget"
++
++#define GET_SUBTARGETINFO_TARGET_DESC
++#define GET_SUBTARGETINFO_CTOR
++#include "M88kGenSubtargetInfo.inc"
++
++void M88kSubtarget::anchor() {}
++
++M88kSubtarget::M88kSubtarget(const Triple &TT,
++                             const std::string &CPU,
++                             const std::string &FS,
++                             const TargetMachine &TM)
++    : M88kGenSubtargetInfo(TT, CPU, /*TuneCPU*/ CPU,
++                           FS),
++      InstrInfo(*this), TLInfo(TM, *this),
++      FrameLowering() {}
+diff --git a/llvm/lib/Target/M88k/M88kSubtarget.h b/llvm/lib/Target/M88k/M88kSubtarget.h
+new file mode 100644
+index 000000000000..4734e2243954
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kSubtarget.h
+@@ -0,0 +1,75 @@
++//===-- M88kSubtarget.h - Define Subtarget for M88k -------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file declares the M88k specific subclass of TargetSubtargetInfo.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KSUBTARGET_H
++#define LLVM_LIB_TARGET_M88K_M88KSUBTARGET_H
++
++#include "M88kFrameLowering.h"
++#include "M88kISelLowering.h"
++#include "M88kInstrInfo.h"
++#include "M88kRegisterInfo.h"
++#include "llvm/CodeGen/TargetFrameLowering.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
++#include "llvm/IR/DataLayout.h"
++#include <string>
++
++#define GET_SUBTARGETINFO_HEADER
++#include "M88kGenSubtargetInfo.inc"
++
++namespace llvm {
++class StringRef;
++class TargetMachine;
++
++class M88kSubtarget : public M88kGenSubtargetInfo {
++  virtual void anchor();
++
++  M88kInstrInfo InstrInfo;
++  M88kTargetLowering TLInfo;
++  M88kFrameLowering FrameLowering;
++
++public:
++  M88kSubtarget(const Triple &TT,
++                const std::string &CPU,
++                const std::string &FS,
++                const TargetMachine &TM);
++
++// Getters for SubtargetFeatures defined in tablegen
++#define GET_SUBTARGETINFO_MACRO(ATTRIBUTE, DEFAULT,    \
++                                GETTER)                \
++  bool GETTER() const { return ATTRIBUTE; }
++#include "M88kGenSubtargetInfo.inc"
++
++  // Automatically generated by tblgen.
++  void ParseSubtargetFeatures(StringRef CPU,
++                              StringRef TuneCPU,
++                              StringRef FS);
++
++  const TargetFrameLowering *
++  getFrameLowering() const override {
++    return &FrameLowering;
++  }
++  const M88kInstrInfo *getInstrInfo() const override {
++    return &InstrInfo;
++  }
++  const M88kRegisterInfo *
++  getRegisterInfo() const override {
++    return &InstrInfo.getRegisterInfo();
++  }
++  const M88kTargetLowering *
++  getTargetLowering() const override {
++    return &TLInfo;
++  }
++};
++
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.cpp b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+index 3b2be847f17d..de1249c11a9a 100644
+--- a/llvm/lib/Target/M88k/M88kTargetMachine.cpp
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+@@ -9,9 +9,131 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "M88kTargetMachine.h"
++#include "M88k.h"
+ #include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/CodeGen/Passes.h"
++#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
++#include "llvm/CodeGen/TargetPassConfig.h"
++#include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/MC/TargetRegistry.h"
+ 
+-extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTarget() {
+-  // TODO Register the target.
+-}
+\ No newline at end of file
++using namespace llvm;
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeM88kTarget() {
++  // Register the target.
++  RegisterTargetMachine<M88kTargetMachine> X(
++      getTheM88kTarget());
++  auto &PR = *PassRegistry::getPassRegistry();
++  initializeM88kDAGToDAGISelPass(PR);
++}
++
++namespace {
++// TODO: Check.
++std::string computeDataLayout(const Triple &TT,
++                              StringRef CPU,
++                              StringRef FS) {
++  std::string Ret;
++
++  // Big endian.
++  Ret += "E";
++
++  // Data mangling.
++  Ret += DataLayout::getManglingComponent(TT);
++
++  // Pointers are 32 bit.
++  Ret += "-p:32:32:32";
++
++  // All scalar types are naturally aligned.
++  Ret += "-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64";
++
++  // Floats and doubles are also naturally aligned.
++  Ret += "-f32:32:32-f64:64:64";
++
++  // We prefer 16 bits of aligned for all globals; see
++  // above.
++  Ret += "-a:8:16";
++
++  // Integer registers are 32bits.
++  Ret += "-n32";
++
++  return Ret;
++}
++} // namespace
++
++/// Create an M88k architecture model.
++M88kTargetMachine::M88kTargetMachine(
++    const Target &T, const Triple &TT, StringRef CPU,
++    StringRef FS, const TargetOptions &Options,
++    std::optional<Reloc::Model> RM,
++    std::optional<CodeModel::Model> CM,
++    CodeGenOpt::Level OL, bool JIT)
++    : LLVMTargetMachine(
++          T, computeDataLayout(TT, CPU, FS), TT, CPU,
++          FS, Options, !RM ? Reloc::Static : *RM,
++          getEffectiveCodeModel(CM, CodeModel::Medium),
++          OL),
++      TLOF(std::make_unique<
++           TargetLoweringObjectFileELF>()) {
++  initAsmInfo();
++}
++
++M88kTargetMachine::~M88kTargetMachine() {}
++
++const M88kSubtarget *
++M88kTargetMachine::getSubtargetImpl(
++    const Function &F) const {
++  Attribute CPUAttr = F.getFnAttribute("target-cpu");
++  Attribute FSAttr =
++      F.getFnAttribute("target-features");
++
++  std::string CPU =
++      !CPUAttr.hasAttribute(Attribute::None)
++          ? CPUAttr.getValueAsString().str()
++          : TargetCPU;
++  std::string FS = !FSAttr.hasAttribute(Attribute::None)
++                       ? FSAttr.getValueAsString().str()
++                       : TargetFS;
++
++  auto &I = SubtargetMap[CPU + FS];
++  if (!I) {
++    // This needs to be done before we create a new
++    // subtarget since any creation will depend on the
++    // TM and the code generation flags on the function
++    // that reside in TargetOptions.
++    resetTargetOptions(F);
++    I = std::make_unique<M88kSubtarget>(TargetTriple,
++                                        CPU, FS, *this);
++  }
++
++  return I.get();
++}
++
++namespace {
++/// M88k Code Generator Pass Configuration Options.
++class M88kPassConfig : public TargetPassConfig {
++public:
++  M88kPassConfig(M88kTargetMachine &TM,
++                 PassManagerBase &PM)
++      : TargetPassConfig(TM, PM) {}
++
++  bool addInstSelector() override;
++  void addPreEmitPass() override;
++};
++} // namespace
++
++TargetPassConfig *M88kTargetMachine::createPassConfig(
++    PassManagerBase &PM) {
++  return new M88kPassConfig(*this, PM);
++}
++
++bool M88kPassConfig::addInstSelector() {
++  addPass(createM88kISelDag(getTM<M88kTargetMachine>(),
++                            getOptLevel()));
++  return false;
++}
++
++void M88kPassConfig::addPreEmitPass() {
++  // TODO Add pass for div-by-zero check.
++}
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.h b/llvm/lib/Target/M88k/M88kTargetMachine.h
+new file mode 100644
+index 000000000000..a464d1b73f94
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.h
+@@ -0,0 +1,50 @@
++//===-- M88kTargetMachine.h - Define TargetMachine for M88k -----*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file declares the M88k specific subclass of TargetMachine.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_M88KTARGETMACHINE_H
++#define LLVM_LIB_TARGET_M88K_M88KTARGETMACHINE_H
++
++#include "M88kSubtarget.h"
++#include "llvm/Target/TargetLoweringObjectFile.h"
++#include "llvm/Target/TargetMachine.h"
++
++namespace llvm {
++
++class M88kTargetMachine : public LLVMTargetMachine {
++  std::unique_ptr<TargetLoweringObjectFile> TLOF;
++  mutable StringMap<std::unique_ptr<M88kSubtarget>>
++      SubtargetMap;
++
++public:
++  M88kTargetMachine(const Target &T, const Triple &TT,
++                    StringRef CPU, StringRef FS,
++                    const TargetOptions &Options,
++                    std::optional<Reloc::Model> RM,
++                    std::optional<CodeModel::Model> CM,
++                    CodeGenOpt::Level OL, bool JIT);
++  ~M88kTargetMachine() override;
++
++  const M88kSubtarget *
++  getSubtargetImpl(const Function &) const override;
++
++  TargetPassConfig *
++  createPassConfig(PassManagerBase &PM) override;
++
++  TargetLoweringObjectFile *
++  getObjFileLowering() const override {
++    return TLOF.get();
++  }
++};
++
++} // end namespace llvm
++
++#endif
+-- 
+2.40.1
+

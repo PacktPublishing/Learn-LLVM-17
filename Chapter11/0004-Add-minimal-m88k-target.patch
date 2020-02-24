@@ -1,0 +1,521 @@
+From 4f0312567e472e83f65d9402ead72a994a12811c Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai.peter.nacke@ibm.com>
+Date: Tue, 17 Oct 2023 17:18:09 -0400
+Subject: [PATCH 4/6] Add minimal m88k target
+
+---
+ llvm/CMakeLists.txt                           |  3 +-
+ llvm/lib/Target/M88k/CMakeLists.txt           | 21 +++++++
+ llvm/lib/Target/M88k/M88k.td                  | 40 +++++++++++++
+ llvm/lib/Target/M88k/M88kInstrFormats.td      | 54 +++++++++++++++++
+ llvm/lib/Target/M88k/M88kInstrInfo.td         | 28 +++++++++
+ llvm/lib/Target/M88k/M88kRegisterInfo.td      | 56 ++++++++++++++++++
+ llvm/lib/Target/M88k/M88kTargetMachine.cpp    | 17 ++++++
+ .../Target/M88k/MCTargetDesc/CMakeLists.txt   | 11 ++++
+ .../M88k/MCTargetDesc/M88kMCTargetDesc.cpp    | 58 +++++++++++++++++++
+ .../M88k/MCTargetDesc/M88kMCTargetDesc.h      | 55 ++++++++++++++++++
+ .../lib/Target/M88k/TargetInfo/CMakeLists.txt |  9 +++
+ .../Target/M88k/TargetInfo/M88kTargetInfo.cpp | 22 +++++++
+ .../Target/M88k/TargetInfo/M88kTargetInfo.h   | 20 +++++++
+ 13 files changed, 393 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/lib/Target/M88k/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/M88k/M88k.td
+ create mode 100644 llvm/lib/Target/M88k/M88kInstrFormats.td
+ create mode 100644 llvm/lib/Target/M88k/M88kInstrInfo.td
+ create mode 100644 llvm/lib/Target/M88k/M88kRegisterInfo.td
+ create mode 100644 llvm/lib/Target/M88k/M88kTargetMachine.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
+ create mode 100644 llvm/lib/Target/M88k/TargetInfo/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.h
+
+diff --git a/llvm/CMakeLists.txt b/llvm/CMakeLists.txt
+index 41cae0e26465..6c3b49d73609 100644
+--- a/llvm/CMakeLists.txt
++++ b/llvm/CMakeLists.txt
+@@ -453,6 +453,7 @@ set(LLVM_ALL_EXPERIMENTAL_TARGETS
+   CSKY
+   DirectX
+   M68k
++  M88k
+   SPIRV
+   Xtensa
+ )
+@@ -463,7 +464,7 @@ set(LLVM_TARGETS_WITH_JIT X86 PowerPC AArch64 ARM Mips SystemZ)
+ set(LLVM_TARGETS_TO_BUILD "all"
+     CACHE STRING "Semicolon-separated list of targets to build, or \"all\".")
+ 
+-set(LLVM_EXPERIMENTAL_TARGETS_TO_BUILD ""
++set(LLVM_EXPERIMENTAL_TARGETS_TO_BUILD "M88k"
+     CACHE STRING "Semicolon-separated list of experimental targets to build, or \"all\".")
+ 
+ option(BUILD_SHARED_LIBS
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+new file mode 100644
+index 000000000000..527f839d5832
+--- /dev/null
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -0,0 +1,21 @@
++add_llvm_component_group(M88k)
++
++set(LLVM_TARGET_DEFINITIONS M88k.td)
++
++tablegen(LLVM M88kGenAsmWriter.inc -gen-asm-writer)
++tablegen(LLVM M88kGenDisassemblerTables.inc -gen-disassembler)
++tablegen(LLVM M88kGenInstrInfo.inc -gen-instr-info)
++tablegen(LLVM M88kGenRegisterInfo.inc -gen-register-info)
++tablegen(LLVM M88kGenSubtargetInfo.inc -gen-subtarget)
++
++add_public_tablegen_target(M88kCommonTableGen)
++
++add_llvm_target(M88kCodeGen
++  M88kTargetMachine.cpp
++
++  ADD_TO_COMPONENT
++  M88k
++  )
++
++add_subdirectory(TargetInfo)
++add_subdirectory(MCTargetDesc)
+diff --git a/llvm/lib/Target/M88k/M88k.td b/llvm/lib/Target/M88k/M88k.td
+new file mode 100644
+index 000000000000..b43033925d23
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88k.td
+@@ -0,0 +1,40 @@
++//===-- M88k.td - Describe the M88000 Target Machine -------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++//
++//===----------------------------------------------------------------------===//
++
++//===----------------------------------------------------------------------===//
++// Target-independent interfaces which we are implementing
++//===----------------------------------------------------------------------===//
++
++include "llvm/Target/Target.td"
++
++//===----------------------------------------------------------------------===//
++// Register File, Calling Conv, Instruction Descriptions
++//===----------------------------------------------------------------------===//
++
++include "M88kRegisterInfo.td"
++include "M88kInstrFormats.td"
++include "M88kInstrInfo.td"
++
++//===----------------------------------------------------------------------===//
++// Declare the target which we are implementing
++//===----------------------------------------------------------------------===//
++
++def M88kInstrInfo : InstrInfo;
++def M88kAsmParser : AsmParser;
++def M88kAsmParserVariant : AsmParserVariant {
++  let RegisterPrefix = "%";
++}
++
++def M88k : Target {
++  let InstructionSet = M88kInstrInfo;
++  let AssemblyParsers  = [M88kAsmParser];
++  let AssemblyParserVariants = [M88kAsmParserVariant];
++}
+diff --git a/llvm/lib/Target/M88k/M88kInstrFormats.td b/llvm/lib/Target/M88k/M88kInstrFormats.td
+new file mode 100644
+index 000000000000..256b0f82329d
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kInstrFormats.td
+@@ -0,0 +1,54 @@
++//===-- M88kInstrFormats.td - M88k Instruction Formats -----*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++class InstM88k<dag outs, dag ins, string asm, string operands,
++               list<dag> pattern = []>
++  : Instruction {
++  bits<32> Inst;
++
++  bits<32> SoftFail = 0; // Needed by disassembler.
++
++  let Namespace = "M88k";
++  let Size = 4;
++
++  dag OutOperandList = outs;
++  dag InOperandList = ins;
++  // Construct the assembler string from template parameters asm and operands.
++  // If the instruction has a delay slot, then append ".n" to the mnemonic.
++  let AsmString = !if(!eq(operands, ""), asm,
++                      !strconcat(asm, " ", operands));
++  let Pattern = pattern;
++
++  let DecoderNamespace = "M88k";
++}
++
++//===----------------------------------------------------------------------===//
++// The formats follow the categories specified in the User Manual.
++//===----------------------------------------------------------------------===//
++
++// Category: Logical.
++class F_L<dag outs, dag ins, string asm, string operands,
++          list<dag> pattern = []>
++   : InstM88k<outs, ins, asm, operands, pattern> {
++  bits<5>  rd;
++  bits<5>  rs1;
++  let Inst{25-21} = rd;
++  let Inst{20-16} = rs1;
++}
++
++// Format: Logical with triadic register.
++class F_LR<bits<5> func, bits<1> comp, string asm, list<dag> pattern = []>
++   : F_L<(outs GPROpnd:$rd), (ins GPROpnd:$rs1, GPROpnd:$rs2),
++         !if(comp, !strconcat(asm, ".c"), asm), "$rd, $rs1, $rs2", pattern> {
++  bits<5>  rs2;
++  let Inst{31-26} = 0b111101;
++  let Inst{15-11} = func;
++  let Inst{10}    = comp;
++  let Inst{9-5}   = 0b00000;
++  let Inst{4-0}   = rs2;
++}
+diff --git a/llvm/lib/Target/M88k/M88kInstrInfo.td b/llvm/lib/Target/M88k/M88kInstrInfo.td
+new file mode 100644
+index 000000000000..d7e8a66822a6
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kInstrInfo.td
+@@ -0,0 +1,28 @@
++//===-- M88kInstrInfo.td - M88k Instructions ---------------*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file describes the M88k instructions in TableGen format.
++//
++//===----------------------------------------------------------------------===//
++
++// ---------------------------------------------------------------------------//
++// Logic and bit field instructions.
++// ---------------------------------------------------------------------------//
++
++// Multiclass for logical instructions with triadic registers.
++multiclass Logic<bits<5> Func, string OpcStr, SDNode OpNode> {
++  let isCommutable = 1 in
++    def rr : F_LR<Func, /*comp=*/0b0, OpcStr,
++                  [(set i32:$rd, (OpNode GPROpnd:$rs1, GPROpnd:$rs2))]>;
++  def rrc : F_LR<Func, /*comp=*/0b1, OpcStr,
++                 [(set i32:$rd, (OpNode GPROpnd:$rs1, (not GPROpnd:$rs2)))]>;
++}
++
++defm AND : Logic<0b01000, "and", and>;
++defm XOR : Logic<0b01010, "xor", xor>;
++defm OR  : Logic<0b01011, "or", or>;
+diff --git a/llvm/lib/Target/M88k/M88kRegisterInfo.td b/llvm/lib/Target/M88k/M88kRegisterInfo.td
+new file mode 100644
+index 000000000000..9e2fbb3ab4d9
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kRegisterInfo.td
+@@ -0,0 +1,56 @@
++//===-- M88kRegisterInfo.td - M88k Register definitions ----*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++class M88kReg<bits<5> Enc, string n> : Register<n> {
++  let HWEncoding{15-5} = 0;
++  let HWEncoding{4-0} = Enc;
++  let Namespace = "M88k";
++}
++
++class M88kCRReg<bits<6> Enc, string n> : Register<n> {
++  let HWEncoding{15-6} = 0;
++  let HWEncoding{5-0} = Enc;
++  let Namespace = "M88k";
++}
++
++class M88kRegisterClass<list<ValueType> types, int size, int alignment,
++                        dag regList, int copycost = 1>
++  : RegisterClass<"M88k", types, alignment, regList> {
++      let Size = size;
++      let CopyCost = copycost;
++}
++
++class M88kRegisterOperand<RegisterClass RC> : RegisterOperand<RC> {
++  let DecoderMethod = "decode"#RC#"RegisterClass";
++}
++
++let Namespace = "M88k" in {
++  def sub_hi : SubRegIndex<32, 0>;
++  def sub_lo : SubRegIndex<32, 32>;
++}
++
++// General-purpose registers
++foreach I = 0-31 in {
++  let isConstant = !eq(I, 0) in
++    def R#I : M88kReg<I, "r"#I>;
++}
++
++def GPR : M88kRegisterClass<[i32, f32], 32, 32,
++                            (add (sequence "R%u", 0, 31))>;
++def GPROpnd : M88kRegisterOperand<GPR> {
++  let GIZeroRegister = R0;
++}
++
++// Register class representing a pair of even-odd GRs.
++def GRPair : RegisterTuples<[sub_hi, sub_lo],
++                            [(add (sequence "R%u", 0, 30, 2)),
++                             (add (sequence "R%u", 1, 31, 2))]>;
++
++def GPR64 : M88kRegisterClass<[i64, f64, v8i8, v4i16, v2i32], 64, 32,
++                              (add GRPair), 2>;
++def GPR64Opnd : M88kRegisterOperand<GPR64>;
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.cpp b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+new file mode 100644
+index 000000000000..3b2be847f17d
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+@@ -0,0 +1,17 @@
++//===-- M88kTargetMachine.cpp - Define TargetMachine for M88k ---*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++//
++//===----------------------------------------------------------------------===//
++
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTarget() {
++  // TODO Register the target.
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
+new file mode 100644
+index 000000000000..698f9baa93ed
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_llvm_component_library(LLVMM88kDesc
++  M88kMCTargetDesc.cpp
++
++  LINK_COMPONENTS
++  MC
++  Support
++  M88kInfo
++
++  ADD_TO_COMPONENT
++  M88k
++  )
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+new file mode 100644
+index 000000000000..399c960b67ce
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+@@ -0,0 +1,58 @@
++//===-- M88kMCTargetDesc.cpp - M88k target descriptions -------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kMCTargetDesc.h"
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/MC/MCDwarf.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCStreamer.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++
++using namespace llvm;
++
++#define GET_INSTRINFO_MC_DESC
++#include "M88kGenInstrInfo.inc"
++
++#define GET_SUBTARGETINFO_MC_DESC
++#include "M88kGenSubtargetInfo.inc"
++
++#define GET_REGINFO_MC_DESC
++#include "M88kGenRegisterInfo.inc"
++
++static MCInstrInfo *createM88kMCInstrInfo() {
++  MCInstrInfo *X = new MCInstrInfo();
++  InitM88kMCInstrInfo(X);
++  return X;
++}
++
++static MCRegisterInfo *createM88kMCRegisterInfo(const Triple &TT) {
++  MCRegisterInfo *X = new MCRegisterInfo();
++  InitM88kMCRegisterInfo(X, M88k::R1);
++  return X;
++}
++
++static MCSubtargetInfo *createM88kMCSubtargetInfo(const Triple &TT,
++                                                  StringRef CPU, StringRef FS) {
++  return createM88kMCSubtargetInfoImpl(TT, CPU, /*TuneCPU*/ CPU, FS);
++}
++
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTargetMC() {
++  // Register the MCInstrInfo.
++  TargetRegistry::RegisterMCInstrInfo(getTheM88kTarget(),
++                                      createM88kMCInstrInfo);
++  // Register the MCRegisterInfo.
++  TargetRegistry::RegisterMCRegInfo(getTheM88kTarget(),
++                                    createM88kMCRegisterInfo);
++
++  // Register the MCSubtargetInfo.
++  TargetRegistry::RegisterMCSubtargetInfo(getTheM88kTarget(),
++                                          createM88kMCSubtargetInfo);
++}
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
+new file mode 100644
+index 000000000000..b67a713ff4ab
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
+@@ -0,0 +1,55 @@
++//===-- M88kMCTargetDesc.h - M88k target descriptions -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCTARGETDESC_H
++#define LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCTARGETDESC_H
++
++#include "llvm/Support/DataTypes.h"
++
++#include <memory>
++
++namespace llvm {
++
++class MCAsmBackend;
++class MCCodeEmitter;
++class MCContext;
++class MCInstrInfo;
++class MCObjectTargetWriter;
++class MCRegisterInfo;
++class MCSubtargetInfo;
++class MCTargetOptions;
++class StringRef;
++class Target;
++class Triple;
++class raw_pwrite_stream;
++class raw_ostream;
++
++MCCodeEmitter *createM88kMCCodeEmitter(const MCInstrInfo &MCII,
++                                       MCContext &Ctx);
++
++MCAsmBackend *createM88kMCAsmBackend(const Target &T,
++                                     const MCSubtargetInfo &STI,
++                                     const MCRegisterInfo &MRI,
++                                     const MCTargetOptions &Options);
++
++std::unique_ptr<MCObjectTargetWriter> createM88kObjectWriter(uint8_t OSABI);
++} // end namespace llvm
++
++// Defines symbolic names for M88k registers.
++// This defines a mapping from register name to register number.
++#define GET_REGINFO_ENUM
++#include "M88kGenRegisterInfo.inc"
++
++// Defines symbolic names for the M88k instructions.
++#define GET_INSTRINFO_ENUM
++#include "M88kGenInstrInfo.inc"
++
++#define GET_SUBTARGETINFO_ENUM
++#include "M88kGenSubtargetInfo.inc"
++
++#endif
+diff --git a/llvm/lib/Target/M88k/TargetInfo/CMakeLists.txt b/llvm/lib/Target/M88k/TargetInfo/CMakeLists.txt
+new file mode 100644
+index 000000000000..d97eaac31142
+--- /dev/null
++++ b/llvm/lib/Target/M88k/TargetInfo/CMakeLists.txt
+@@ -0,0 +1,9 @@
++add_llvm_component_library(LLVMM88kInfo
++  M88kTargetInfo.cpp
++
++  LINK_COMPONENTS
++  Support
++
++  ADD_TO_COMPONENT
++  M88k
++  )
+diff --git a/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.cpp b/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.cpp
+new file mode 100644
+index 000000000000..99bd52028534
+--- /dev/null
++++ b/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.cpp
+@@ -0,0 +1,22 @@
++//===-- M88kTargetInfo.cpp - M88k target implementation -------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/MC/TargetRegistry.h"
++
++using namespace llvm;
++
++Target &llvm::getTheM88kTarget() {
++  static Target TheM88kTarget;
++  return TheM88kTarget;
++}
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTargetInfo() {
++  RegisterTarget<Triple::m88k, /*HasJIT=*/false> X(getTheM88kTarget(), "m88k",
++                                                   "M88k", "M88k");
++}
+diff --git a/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.h b/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.h
+new file mode 100644
+index 000000000000..3c97e03a122d
+--- /dev/null
++++ b/llvm/lib/Target/M88k/TargetInfo/M88kTargetInfo.h
+@@ -0,0 +1,20 @@
++//===-- M88kTargetInfo.h - M88k target implementation -----------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_TARGETINFO_M88KTARGETINFO_H
++#define LLVM_LIB_TARGET_M88K_TARGETINFO_M88KTARGETINFO_H
++
++namespace llvm {
++
++class Target;
++
++Target &getTheM88kTarget();
++
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_M88K_TARGETINFO_M88KTARGETINFO_H
+-- 
+2.40.1
+

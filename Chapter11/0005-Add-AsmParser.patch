@@ -1,0 +1,857 @@
+From f72ec73029d0bd1966879f61049034e50896d6f7 Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai.peter.nacke@ibm.com>
+Date: Tue, 17 Oct 2023 20:54:01 -0400
+Subject: [PATCH 5/6] Add AsmParser
+
+---
+ llvm/lib/Target/M88k/AsmParser/CMakeLists.txt |  13 +
+ .../Target/M88k/AsmParser/M88kAsmParser.cpp   | 375 ++++++++++++++++++
+ llvm/lib/Target/M88k/CMakeLists.txt           |   3 +
+ llvm/lib/Target/M88k/M88k.td                  |   7 +
+ .../Target/M88k/MCTargetDesc/CMakeLists.txt   |   3 +
+ .../M88k/MCTargetDesc/M88kInstPrinter.cpp     |  63 +++
+ .../M88k/MCTargetDesc/M88kInstPrinter.h       |  51 +++
+ .../M88k/MCTargetDesc/M88kMCAsmInfo.cpp       |  29 ++
+ .../Target/M88k/MCTargetDesc/M88kMCAsmInfo.h  |  25 ++
+ .../M88k/MCTargetDesc/M88kMCCodeEmitter.cpp   |  94 +++++
+ .../M88k/MCTargetDesc/M88kMCTargetDesc.cpp    |  30 +-
+ .../M88k/MCTargetDesc/M88kMCTargetDesc.h      |   7 -
+ 12 files changed, 692 insertions(+), 8 deletions(-)
+ create mode 100644 llvm/lib/Target/M88k/AsmParser/CMakeLists.txt
+ create mode 100644 llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.h
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
+
+diff --git a/llvm/lib/Target/M88k/AsmParser/CMakeLists.txt b/llvm/lib/Target/M88k/AsmParser/CMakeLists.txt
+new file mode 100644
+index 000000000000..d59ae8467d6e
+--- /dev/null
++++ b/llvm/lib/Target/M88k/AsmParser/CMakeLists.txt
+@@ -0,0 +1,13 @@
++add_llvm_component_library(LLVMM88kAsmParser
++  M88kAsmParser.cpp
++
++  LINK_COMPONENTS
++  MC
++  MCParser
++  Support
++  M88kDesc
++  M88kInfo
++
++  ADD_TO_COMPONENT
++  M88k
++  )
+diff --git a/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp b/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
+new file mode 100644
+index 000000000000..6193e0d1c8bb
+--- /dev/null
++++ b/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
+@@ -0,0 +1,375 @@
++//===-- M88kAsmParser.cpp - Parse M88k assembly to
++// MCInst instructions ----===//
++//
++// Part of the LLVM Project, under the Apache License
++// v2.0 with LLVM Exceptions. See
++// https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH
++// LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/M88kInstPrinter.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "TargetInfo/M88kTargetInfo.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/MC/MCAsmMacro.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCParser/MCAsmLexer.h"
++#include "llvm/MC/MCParser/MCAsmParser.h"
++#include "llvm/MC/MCParser/MCParsedAsmOperand.h"
++#include "llvm/MC/MCParser/MCTargetAsmParser.h"
++#include "llvm/MC/MCStreamer.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/MC/MCSymbol.h"
++#include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/Compiler.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/SMLoc.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/TargetParser/SubtargetFeature.h"
++#include <cassert>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++using namespace llvm;
++
++namespace {
++
++// Instances of this class represented a parsed machine
++// instruction
++class M88kOperand : public MCParsedAsmOperand {
++  enum OperandKind {
++    OpKind_Token,
++    OpKind_Reg,
++    OpKind_Imm,
++  };
++
++  OperandKind Kind;
++  SMLoc StartLoc, EndLoc;
++
++  union {
++    StringRef Token;
++    unsigned RegNo;
++    const MCExpr *Imm;
++  };
++
++  void addExpr(MCInst &Inst, const MCExpr *Expr) const {
++    // Add as immediates when possible.  Null MCExpr =
++    // 0.
++    if (!Expr)
++      Inst.addOperand(MCOperand::createImm(0));
++    else if (auto *CE = dyn_cast<MCConstantExpr>(Expr))
++      Inst.addOperand(
++          MCOperand::createImm(CE->getValue()));
++    else
++      Inst.addOperand(MCOperand::createExpr(Expr));
++  }
++
++public:
++  M88kOperand(OperandKind Kind, SMLoc StartLoc,
++              SMLoc EndLoc)
++      : Kind(Kind), StartLoc(StartLoc), EndLoc(EndLoc) {
++  }
++
++  // getStartLoc - Gets location of the first token of
++  // this operand
++  SMLoc getStartLoc() const override {
++    return StartLoc;
++  }
++
++  // getEndLoc - Gets location of the last token of this
++  // operand
++  SMLoc getEndLoc() const override { return EndLoc; }
++
++  bool isReg() const override {
++    return Kind == OpKind_Reg;
++  }
++
++  unsigned getReg() const override {
++    assert(isReg() && "Invalid type access!");
++    return RegNo;
++  }
++
++  bool isImm() const override {
++    return Kind == OpKind_Imm;
++  }
++
++  const MCExpr *getImm() const {
++    assert(isImm() && "Invalid type access!");
++    return Imm;
++  }
++
++  bool isToken() const override {
++    return Kind == OpKind_Token;
++  }
++
++  StringRef getToken() const {
++    assert(isToken() && "Not a token");
++    return Token;
++  }
++
++  bool isMem() const override { return false; }
++
++  static std::unique_ptr<M88kOperand>
++  createToken(StringRef Str, SMLoc Loc) {
++    auto Op = std::make_unique<M88kOperand>(
++        OpKind_Token, Loc, Loc);
++    Op->Token = Str;
++    return Op;
++  }
++
++  static std::unique_ptr<M88kOperand>
++  createReg(unsigned Num, SMLoc StartLoc,
++            SMLoc EndLoc) {
++    auto Op = std::make_unique<M88kOperand>(
++        OpKind_Reg, StartLoc, EndLoc);
++    Op->RegNo = Num;
++    return Op;
++  }
++
++  static std::unique_ptr<M88kOperand>
++  createImm(const MCExpr *Expr, SMLoc StartLoc,
++            SMLoc EndLoc) {
++    auto Op = std::make_unique<M88kOperand>(
++        OpKind_Imm, StartLoc, EndLoc);
++    Op->Imm = Expr;
++    return Op;
++  }
++
++  // Used by the TableGen code to add particular types
++  // of operand to an instruction.
++  void addRegOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands");
++    Inst.addOperand(MCOperand::createReg(getReg()));
++  }
++
++  void addImmOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands");
++    addExpr(Inst, getImm());
++  }
++
++  void print(raw_ostream &OS) const override {
++    switch (Kind) {
++    case OpKind_Imm:
++      OS << "Imm: " << getImm() << "\n";
++      break;
++    case OpKind_Token:
++      OS << "Token: " << getToken() << "\n";
++      break;
++    case OpKind_Reg:
++      OS << "Reg: "
++         << M88kInstPrinter::getRegisterName(getReg())
++         << "\n";
++      break;
++    }
++  }
++};
++
++class M88kAsmParser : public MCTargetAsmParser {
++// Auto-generated instruction matching functions
++#define GET_ASSEMBLER_HEADER
++#include "M88kGenAsmMatcher.inc"
++
++  MCAsmParser &Parser;
++  const MCSubtargetInfo &SubtargetInfo;
++
++  bool
++  ParseInstruction(ParseInstructionInfo &Info,
++                   StringRef Name, SMLoc NameLoc,
++                   OperandVector &Operands) override;
++  bool parseRegister(MCRegister &RegNo, SMLoc &StartLoc,
++                     SMLoc &EndLoc) override;
++  OperandMatchResultTy
++  tryParseRegister(MCRegister &RegNo, SMLoc &StartLoc,
++                   SMLoc &EndLoc) override;
++
++  bool parseRegister(MCRegister &RegNo, SMLoc &StartLoc,
++                     SMLoc &EndLoc,
++                     bool RestoreOnFailure);
++  bool parseOperand(OperandVector &Operands,
++                    StringRef Mnemonic);
++
++  bool MatchAndEmitInstruction(
++      SMLoc IdLoc, unsigned &Opcode,
++      OperandVector &Operands, MCStreamer &Out,
++      uint64_t &ErrorInfo,
++      bool MatchingInlineAsm) override;
++
++public:
++  M88kAsmParser(const MCSubtargetInfo &STI,
++                MCAsmParser &Parser,
++                const MCInstrInfo &MII,
++                const MCTargetOptions &Options)
++      : MCTargetAsmParser(Options, STI, MII),
++        Parser(Parser), SubtargetInfo(STI) {
++    setAvailableFeatures(ComputeAvailableFeatures(
++        SubtargetInfo.getFeatureBits()));
++  }
++};
++
++} // end anonymous namespace
++
++#define GET_REGISTER_MATCHER
++#define GET_MATCHER_IMPLEMENTATION
++#include "M88kGenAsmMatcher.inc"
++
++bool M88kAsmParser::ParseInstruction(
++    ParseInstructionInfo &Info, StringRef Name,
++    SMLoc NameLoc, OperandVector &Operands) {
++  // First operand in MCInst is instruction mnemonic.
++  Operands.push_back(
++      M88kOperand::createToken(Name, NameLoc));
++
++  // Read the remaining operands.
++  if (getLexer().isNot(AsmToken::EndOfStatement)) {
++
++    // Read the first operand.
++    if (parseOperand(Operands, Name)) {
++      return Error(getLexer().getLoc(),
++                   "expected operand");
++    }
++
++    // Read the following operands.
++    while (getLexer().is(AsmToken::Comma)) {
++      Parser.Lex();
++      if (parseOperand(Operands, Name)) {
++        return Error(getLexer().getLoc(),
++                     "expected operand");
++      }
++    }
++    if (getLexer().isNot(AsmToken::EndOfStatement))
++      return Error(getLexer().getLoc(),
++                   "unexpected token in argument list");
++  }
++
++  // Consume the EndOfStatement.
++  Parser.Lex();
++  return false;
++}
++
++bool M88kAsmParser::parseOperand(
++    OperandVector &Operands, StringRef Mnemonic) {
++  // Check if it is a register.
++  if (Parser.getTok().is(AsmToken::Percent)) {
++    MCRegister RegNo;
++    SMLoc StartLoc, EndLoc;
++    if (parseRegister(RegNo, StartLoc, EndLoc,
++                      /*RestoreOnFailure=*/false))
++      return true;
++    Operands.push_back(M88kOperand::createReg(
++        RegNo, StartLoc, EndLoc));
++    return false;
++  }
++
++  // Could be immediate or address.
++  if (Parser.getTok().is(AsmToken::Integer)) {
++    SMLoc StartLoc = Parser.getTok().getLoc();
++    const MCExpr *Expr;
++    if (Parser.parseExpression(Expr))
++      return true;
++    SMLoc EndLoc = Parser.getTok().getLoc();
++    Operands.push_back(
++        M88kOperand::createImm(Expr, StartLoc, EndLoc));
++    return false;
++  }
++  // Failure
++  return true;
++}
++
++// Parses register of form %(r|x|cr|fcr)<No>.
++bool M88kAsmParser::parseRegister(
++    MCRegister &RegNo, SMLoc &StartLoc, SMLoc &EndLoc,
++    bool RestoreOnFailure) {
++  StartLoc = Parser.getTok().getLoc();
++
++  // Eat the '%' prefix.
++  if (Parser.getTok().isNot(AsmToken::Percent))
++    return true;
++  const AsmToken &PercentTok = Parser.getTok();
++  Parser.Lex();
++
++  // Match the register.
++  if (Parser.getTok().isNot(AsmToken::Identifier) ||
++      (RegNo = MatchRegisterName(
++           Parser.getTok().getIdentifier())) == 0) {
++    if (RestoreOnFailure)
++      Parser.getLexer().UnLex(PercentTok);
++    return Error(StartLoc, "invalid register");
++  }
++
++  Parser.Lex(); // Eat identifier token.
++  EndLoc = Parser.getTok().getLoc();
++  return false;
++}
++
++bool M88kAsmParser::parseRegister(MCRegister &RegNo,
++                                  SMLoc &StartLoc,
++                                  SMLoc &EndLoc) {
++  return parseRegister(RegNo, StartLoc, EndLoc,
++                       /*RestoreOnFailure=*/false);
++}
++
++OperandMatchResultTy M88kAsmParser::tryParseRegister(
++    MCRegister &RegNo, SMLoc &StartLoc, SMLoc &EndLoc) {
++  bool Result =
++      parseRegister(RegNo, StartLoc, EndLoc,
++                    /*RestoreOnFailure=*/true);
++  bool PendingErrors = getParser().hasPendingError();
++  getParser().clearPendingErrors();
++  if (PendingErrors)
++    return MatchOperand_ParseFail;
++  if (Result)
++    return MatchOperand_NoMatch;
++  return MatchOperand_Success;
++}
++
++bool M88kAsmParser::MatchAndEmitInstruction(
++    SMLoc IdLoc, unsigned &Opcode,
++    OperandVector &Operands, MCStreamer &Out,
++    uint64_t &ErrorInfo, bool MatchingInlineAsm) {
++  MCInst Inst;
++  SMLoc ErrorLoc;
++
++  switch (MatchInstructionImpl(
++      Operands, Inst, ErrorInfo, MatchingInlineAsm)) {
++  case Match_Success:
++    Out.emitInstruction(Inst, SubtargetInfo);
++    Opcode = Inst.getOpcode();
++    return false;
++  case Match_MissingFeature:
++    return Error(IdLoc, "Instruction use requires "
++                        "option to be enabled");
++  case Match_MnemonicFail:
++    return Error(IdLoc,
++                 "Unrecognized instruction mnemonic");
++  case Match_InvalidOperand: {
++    ErrorLoc = IdLoc;
++    if (ErrorInfo != ~0U) {
++      if (ErrorInfo >= Operands.size())
++        return Error(
++            IdLoc, "Too few operands for instruction");
++
++      ErrorLoc = ((M88kOperand &)*Operands[ErrorInfo])
++                     .getStartLoc();
++      if (ErrorLoc == SMLoc())
++        ErrorLoc = IdLoc;
++    }
++    return Error(ErrorLoc,
++                 "Invalid operand for instruction");
++  }
++  default:
++    break;
++  }
++
++  llvm_unreachable("Unknown match type detected!");
++}
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void
++LLVMInitializeM88kAsmParser() {
++  RegisterMCAsmParser<M88kAsmParser> X(
++      getTheM88kTarget());
++}
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+index 527f839d5832..068b625225d3 100644
+--- a/llvm/lib/Target/M88k/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -2,7 +2,9 @@ add_llvm_component_group(M88k)
+ 
+ set(LLVM_TARGET_DEFINITIONS M88k.td)
+ 
++tablegen(LLVM M88kGenAsmMatcher.inc -gen-asm-matcher)
+ tablegen(LLVM M88kGenAsmWriter.inc -gen-asm-writer)
++tablegen(LLVM M88kGenMCCodeEmitter.inc -gen-emitter)
+ tablegen(LLVM M88kGenDisassemblerTables.inc -gen-disassembler)
+ tablegen(LLVM M88kGenInstrInfo.inc -gen-instr-info)
+ tablegen(LLVM M88kGenRegisterInfo.inc -gen-register-info)
+@@ -17,5 +19,6 @@ add_llvm_target(M88kCodeGen
+   M88k
+   )
+ 
++add_subdirectory(AsmParser)
+ add_subdirectory(TargetInfo)
+ add_subdirectory(MCTargetDesc)
+diff --git a/llvm/lib/Target/M88k/M88k.td b/llvm/lib/Target/M88k/M88k.td
+index b43033925d23..7ff2db114160 100644
+--- a/llvm/lib/Target/M88k/M88k.td
++++ b/llvm/lib/Target/M88k/M88k.td
+@@ -33,8 +33,15 @@ def M88kAsmParserVariant : AsmParserVariant {
+   let RegisterPrefix = "%";
+ }
+ 
++def M88kAsmWriter : AsmWriter {
++  string AsmWriterClassName  = "InstPrinter";
++  int PassSubtarget = 1;
++  int Variant = 0;
++}
++
+ def M88k : Target {
+   let InstructionSet = M88kInstrInfo;
+   let AssemblyParsers  = [M88kAsmParser];
+   let AssemblyParserVariants = [M88kAsmParserVariant];
++  let AssemblyWriters = [M88kAsmWriter];
+ }
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
+index 698f9baa93ed..84d9899ff640 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/MCTargetDesc/CMakeLists.txt
+@@ -1,4 +1,7 @@
+ add_llvm_component_library(LLVMM88kDesc
++  M88kInstPrinter.cpp
++  M88kMCCodeEmitter.cpp
++  M88kMCAsmInfo.cpp
+   M88kMCTargetDesc.cpp
+ 
+   LINK_COMPONENTS
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
+new file mode 100644
+index 000000000000..f0de67a1ac80
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
+@@ -0,0 +1,63 @@
++//===- M88kInstPrinter.cpp - Convert M88k MCInst to assembly syntax -------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kInstPrinter.h"
++#include "llvm/MC/MCAsmInfo.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCSymbol.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cassert>
++#include <cstdint>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "asm-printer"
++
++#include "M88kGenAsmWriter.inc"
++
++void M88kInstPrinter::printOperand(const MCInst *MI, int OpNum,
++                                   const MCSubtargetInfo &STI, raw_ostream &O) {
++  const MCOperand &MO = MI->getOperand(OpNum);
++  if (MO.isReg()) {
++    if (!MO.getReg())
++      O << '0';
++    else
++      O << '%' << getRegisterName(MO.getReg());
++  } else if (MO.isImm())
++    O << MO.getImm();
++  else if (MO.isExpr())
++    MO.getExpr()->print(O, &MAI);
++  else
++    llvm_unreachable("Invalid operand");
++}
++
++void M88kInstPrinter::printOperand(const MCOperand &MO, const MCAsmInfo *MAI,
++                                   raw_ostream &O) {
++  if (MO.isReg()) {
++    if (!MO.getReg())
++      O << '0';
++    else
++      O << '%' << getRegisterName(MO.getReg());
++  } else if (MO.isImm())
++    O << MO.getImm();
++  else if (MO.isExpr())
++    MO.getExpr()->print(O, MAI);
++  else
++    llvm_unreachable("Invalid operand");
++}
++
++void M88kInstPrinter::printInst(const MCInst *MI, uint64_t Address,
++                                StringRef Annot, const MCSubtargetInfo &STI,
++                                raw_ostream &O) {
++  printInstruction(MI, Address, STI, O);
++  printAnnotation(O, Annot);
++}
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
+new file mode 100644
+index 000000000000..4b92e9749dcd
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
+@@ -0,0 +1,51 @@
++//==- M88kInstPrinter.h - Convert M88k MCInst to assembly --------*- C++ -*-==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This class prints a M88k MCInst to a .s file.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KINSTPRINTER_H
++#define LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KINSTPRINTER_H
++
++#include "llvm/MC/MCInstPrinter.h"
++#include "llvm/MC/MCRegister.h"
++#include <cstdint>
++
++namespace llvm {
++
++class MCAsmInfo;
++class MCOperand;
++
++class M88kInstPrinter : public MCInstPrinter {
++public:
++  M88kInstPrinter(const MCAsmInfo &MAI, const MCInstrInfo &MII,
++                  const MCRegisterInfo &MRI)
++      : MCInstPrinter(MAI, MII, MRI) {}
++
++  // Automatically generated by tblgen.
++  std::pair<const char *, uint64_t> getMnemonic(const MCInst *MI) override;
++  void printInstruction(const MCInst *MI, uint64_t Address,
++                        const MCSubtargetInfo &STI, raw_ostream &O);
++  static const char *getRegisterName(MCRegister RegNo);
++
++  // Print the given operand.
++  void printOperand(const MCInst *MI, int OpNum, const MCSubtargetInfo &STI,
++                    raw_ostream &O);
++  static void printOperand(const MCOperand &MO, const MCAsmInfo *MAI,
++                           raw_ostream &O);
++
++  // Override MCInstPrinter.
++  // void printRegName(raw_ostream &O, unsigned RegNo) const override;
++  void printInst(const MCInst *MI, uint64_t Address, StringRef Annot,
++                 const MCSubtargetInfo &STI, raw_ostream &O) override;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KINSTPRINTER_H
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.cpp
+new file mode 100644
+index 000000000000..882d95fe4d7e
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.cpp
+@@ -0,0 +1,29 @@
++//===-- M88kMCAsmInfo.cpp - M88k asm properties ---------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88kMCAsmInfo.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCSectionELF.h"
++
++using namespace llvm;
++
++M88kMCAsmInfo::M88kMCAsmInfo(const Triple &TT) {
++  // TODO: Check!
++  CodePointerSize = 4;
++  CalleeSaveStackSlotSize = 4;
++  IsLittleEndian = false;
++  UseDotAlignForAlignment = true;
++  MinInstAlignment = 4;
++
++  CommentString = "|"; // # as comment delimiter is only allowed at first column
++  ZeroDirective = "\t.space\t";
++  Data64bitsDirective = "\t.quad\t";
++  UsesELFSectionDirectiveForBSS = true;
++  SupportsDebugInformation = false;
++  ExceptionsType = ExceptionHandling::SjLj;
++}
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.h
+new file mode 100644
+index 000000000000..d1d975d904fc
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCAsmInfo.h
+@@ -0,0 +1,25 @@
++//====-- M88kMCAsmInfo.h - M88k asm properties ---------------*- C++ -*--===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCASMINFO_H
++#define LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCASMINFO_H
++
++#include "llvm/MC/MCAsmInfoELF.h"
++#include "llvm/Support/Compiler.h"
++
++namespace llvm {
++class Triple;
++
++class M88kMCAsmInfo : public MCAsmInfoELF {
++public:
++  explicit M88kMCAsmInfo(const Triple &TT);
++};
++
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
+new file mode 100644
+index 000000000000..b00081ba2885
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
+@@ -0,0 +1,94 @@
++//===-- M88kMCCodeEmitter.cpp - Convert M88k code to machine code ---------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements the M88kMCCodeEmitter class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/MC/MCCodeEmitter.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCInst.h"
++#include "llvm/MC/MCInstrInfo.h"
++#include "llvm/MC/MCRegisterInfo.h"
++#include "llvm/MC/MCSubtargetInfo.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/EndianStream.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cassert>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "mccodeemitter"
++
++STATISTIC(MCNumEmitted, "Number of MC instructions emitted");
++
++namespace {
++
++class M88kMCCodeEmitter : public MCCodeEmitter {
++  const MCInstrInfo &MCII;
++  MCContext &Ctx;
++
++public:
++  M88kMCCodeEmitter(const MCInstrInfo &MCII,
++                    MCContext &Ctx)
++      : MCII(MCII), Ctx(Ctx) {}
++
++  ~M88kMCCodeEmitter() override = default;
++
++  // OVerride MCCodeEmitter.
++  void encodeInstruction(const MCInst &MI, raw_ostream &OS,
++                         SmallVectorImpl<MCFixup> &Fixups,
++                         const MCSubtargetInfo &STI) const override;
++
++  // Generated by TableGen.
++  uint64_t getBinaryCodeForInstr(const MCInst &MI,
++                                 SmallVectorImpl<MCFixup> &Fixups,
++                                 const MCSubtargetInfo &STI) const;
++
++  // Functions called by the generated function.
++
++  /// \brief Return the binary encoding of operand. If the machine
++  /// operand requires relocation, record the relocation and return zero.
++  unsigned getMachineOpValue(const MCInst &MI, const MCOperand &MO,
++                             SmallVectorImpl<MCFixup> &Fixups,
++                             const MCSubtargetInfo &STI) const;
++};
++
++} // end anonymous namespace
++
++void M88kMCCodeEmitter::encodeInstruction(const MCInst &MI, raw_ostream &OS,
++                                          SmallVectorImpl<MCFixup> &Fixups,
++                                          const MCSubtargetInfo &STI) const {
++  // Get instruction encoding and emit it.
++  uint64_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
++  ++MCNumEmitted; // Keep track of the number of emitted insns.
++
++  support::endian::write<uint32_t>(OS, Bits, support::big);
++}
++
++unsigned
++M88kMCCodeEmitter::getMachineOpValue(const MCInst &MI, const MCOperand &MO,
++                                     SmallVectorImpl<MCFixup> &Fixups,
++                                     const MCSubtargetInfo &STI) const {
++  if (MO.isReg())
++    return Ctx.getRegisterInfo()->getEncodingValue(MO.getReg());
++  if (MO.isImm())
++    return static_cast<uint64_t>(MO.getImm());
++  return 0;
++}
++
++//#define ENABLE_INSTR_PREDICATE_VERIFIER
++#include "M88kGenMCCodeEmitter.inc"
++
++MCCodeEmitter *llvm::createM88kMCCodeEmitter(const MCInstrInfo &MCII,
++                                             MCContext &Ctx) {
++  return new M88kMCCodeEmitter(MCII, Ctx);
++}
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+index 399c960b67ce..12a68d7ef6a3 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+@@ -7,6 +7,8 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "M88kMCTargetDesc.h"
++#include "M88kInstPrinter.h"
++#include "M88kMCAsmInfo.h"
+ #include "TargetInfo/M88kTargetInfo.h"
+ #include "llvm/MC/MCDwarf.h"
+ #include "llvm/MC/MCInstrInfo.h"
+@@ -26,6 +28,21 @@ using namespace llvm;
+ #define GET_REGINFO_MC_DESC
+ #include "M88kGenRegisterInfo.inc"
+ 
++static MCInstPrinter *createM88kMCInstPrinter(const Triple &T,
++                                              unsigned SyntaxVariant,
++                                              const MCAsmInfo &MAI,
++                                              const MCInstrInfo &MII,
++                                              const MCRegisterInfo &MRI) {
++  return new M88kInstPrinter(MAI, MII, MRI);
++}
++
++static MCAsmInfo *createM88kMCAsmInfo(const MCRegisterInfo &MRI,
++                                      const Triple &TT,
++                                      const MCTargetOptions &Options) {
++  MCAsmInfo *MAI = new M88kMCAsmInfo(TT);
++  return MAI;
++}
++
+ static MCInstrInfo *createM88kMCInstrInfo() {
+   MCInstrInfo *X = new MCInstrInfo();
+   InitM88kMCInstrInfo(X);
+@@ -43,11 +60,18 @@ static MCSubtargetInfo *createM88kMCSubtargetInfo(const Triple &TT,
+   return createM88kMCSubtargetInfoImpl(TT, CPU, /*TuneCPU*/ CPU, FS);
+ }
+ 
+-
+ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTargetMC() {
++  // Register the MCAsmInfo.
++  TargetRegistry::RegisterMCAsmInfo(getTheM88kTarget(), createM88kMCAsmInfo);
++
++  // Register the MCCodeEmitter.
++  TargetRegistry::RegisterMCCodeEmitter(getTheM88kTarget(),
++                                        createM88kMCCodeEmitter);
++
+   // Register the MCInstrInfo.
+   TargetRegistry::RegisterMCInstrInfo(getTheM88kTarget(),
+                                       createM88kMCInstrInfo);
++
+   // Register the MCRegisterInfo.
+   TargetRegistry::RegisterMCRegInfo(getTheM88kTarget(),
+                                     createM88kMCRegisterInfo);
+@@ -55,4 +79,8 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTargetMC() {
+   // Register the MCSubtargetInfo.
+   TargetRegistry::RegisterMCSubtargetInfo(getTheM88kTarget(),
+                                           createM88kMCSubtargetInfo);
++
++  // Register the MCInstPrinter.
++  TargetRegistry::RegisterMCInstPrinter(getTheM88kTarget(),
++                                        createM88kMCInstPrinter);
+ }
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
+index b67a713ff4ab..7d6405177a49 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.h
+@@ -31,13 +31,6 @@ class raw_ostream;
+ 
+ MCCodeEmitter *createM88kMCCodeEmitter(const MCInstrInfo &MCII,
+                                        MCContext &Ctx);
+-
+-MCAsmBackend *createM88kMCAsmBackend(const Target &T,
+-                                     const MCSubtargetInfo &STI,
+-                                     const MCRegisterInfo &MRI,
+-                                     const MCTargetOptions &Options);
+-
+-std::unique_ptr<MCObjectTargetWriter> createM88kObjectWriter(uint8_t OSABI);
+ } // end namespace llvm
+ 
+ // Defines symbolic names for M88k registers.
+-- 
+2.40.1
+

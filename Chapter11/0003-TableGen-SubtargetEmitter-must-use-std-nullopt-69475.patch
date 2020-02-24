@@ -1,0 +1,41 @@
+From ebabc1741b4dc96532fbba84ddbee37f6343986d Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai.peter.nacke@ibm.com>
+Date: Wed, 18 Oct 2023 13:11:23 -0400
+Subject: [PATCH 3/6] [TableGen] SubtargetEmitter must use std::nullopt
+ (#69475)
+
+Use of llvm::Optional was migrated to std::optional. This included a
+change in the constructor of ArrayRef.
+However, there are still 2 places in the SubtargetEmitter which uses
+llvm::None, causing a compile error when emitted.
+
+(cherry picked from commit a587f42953930119d743da863458eaee45c6b70c)
+---
+ llvm/utils/TableGen/SubtargetEmitter.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/utils/TableGen/SubtargetEmitter.cpp b/llvm/utils/TableGen/SubtargetEmitter.cpp
+index e4eb23649e96..e204646545f2 100644
+--- a/llvm/utils/TableGen/SubtargetEmitter.cpp
++++ b/llvm/utils/TableGen/SubtargetEmitter.cpp
+@@ -1933,7 +1933,7 @@ void SubtargetEmitter::run(raw_ostream &OS) {
+   if (NumProcs)
+     OS << Target << "SubTypeKV, ";
+   else
+-    OS << "None, ";
++    OS << "std::nullopt, ";
+   OS << '\n'; OS.indent(22);
+   OS << Target << "WriteProcResTable, "
+      << Target << "WriteLatencyTable, "
+@@ -2026,7 +2026,7 @@ void SubtargetEmitter::run(raw_ostream &OS) {
+   if (NumProcs)
+     OS << "ArrayRef(" << Target << "SubTypeKV, " << NumProcs << "), ";
+   else
+-    OS << "None, ";
++    OS << "std::nullopt, ";
+   OS << '\n'; OS.indent(24);
+   OS << Target << "WriteProcResTable, "
+      << Target << "WriteLatencyTable, "
+-- 
+2.40.1
+

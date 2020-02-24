@@ -1,0 +1,842 @@
+From 17f4a27dd3b1d6b6d02472ce84c0aa9ddeedd5d4 Mon Sep 17 00:00:00 2001
+From: Kai Nacke <kai@redstar.de>
+Date: Tue, 26 Dec 2023 18:49:33 -0500
+Subject: [PATCH 9/9] Add m88k-div-instr pass
+
+---
+ .../Target/M88k/AsmParser/M88kAsmParser.cpp   |  99 +++++++++
+ llvm/lib/Target/M88k/CMakeLists.txt           |   1 +
+ llvm/lib/Target/M88k/M88k.h                   |   3 +
+ llvm/lib/Target/M88k/M88kDivInstr.cpp         | 189 ++++++++++++++++++
+ llvm/lib/Target/M88k/M88kInstrFormats.td      |  53 +++++
+ llvm/lib/Target/M88k/M88kInstrInfo.td         |  85 ++++++++
+ llvm/lib/Target/M88k/M88kTargetMachine.cpp    |  18 +-
+ llvm/lib/Target/M88k/M88kTargetMachine.h      |   2 +
+ .../Target/M88k/MCTargetDesc/M88kBaseInfo.h   |  38 ++++
+ .../M88k/MCTargetDesc/M88kInstPrinter.cpp     |  33 +++
+ .../M88k/MCTargetDesc/M88kInstPrinter.h       |   5 +
+ .../M88k/MCTargetDesc/M88kMCCodeEmitter.cpp   |  26 ++-
+ .../Target/M88k/MCTargetDesc/M88kMCFixups.h   |  31 +++
+ .../M88k/MCTargetDesc/M88kMCTargetDesc.cpp    |   1 +
+ 14 files changed, 579 insertions(+), 5 deletions(-)
+ create mode 100755 llvm/lib/Target/M88k/M88kDivInstr.cpp
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kBaseInfo.h
+ create mode 100644 llvm/lib/Target/M88k/MCTargetDesc/M88kMCFixups.h
+
+diff --git a/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp b/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
+index 6193e0d1c8bb..ee57f73b6cba 100644
+--- a/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
++++ b/llvm/lib/Target/M88k/AsmParser/M88kAsmParser.cpp
+@@ -39,6 +39,15 @@ using namespace llvm;
+ 
+ namespace {
+ 
++// Return true if Expr is in the range [MinValue, MaxValue].
++bool inRange(const MCExpr *Expr, int64_t MinValue, int64_t MaxValue) {
++  if (auto *CE = dyn_cast<MCConstantExpr>(Expr)) {
++    int64_t Value = CE->getValue();
++    return Value >= MinValue && Value <= MaxValue;
++  }
++  return false;
++}
++
+ // Instances of this class represented a parsed machine
+ // instruction
+ class M88kOperand : public MCParsedAsmOperand {
+@@ -152,6 +161,13 @@ public:
+     addExpr(Inst, getImm());
+   }
+ 
++  void addConditionCodeOperands(MCInst &Inst, unsigned N) const {
++    assert(N == 1 && "Invalid number of operands");
++    addExpr(Inst, getImm());
++  }
++
++  bool isCCode() const { return Kind == OpKind_Imm && inRange(Imm, 0, 31); }
++
+   void print(raw_ostream &OS) const override {
+     switch (Kind) {
+     case OpKind_Imm:
+@@ -193,6 +209,14 @@ class M88kAsmParser : public MCTargetAsmParser {
+   bool parseOperand(OperandVector &Operands,
+                     StringRef Mnemonic);
+ 
++  ParseStatus parseConditionCode(OperandVector &Operands);
++
++  ParseStatus parsePCRel(OperandVector &Operands, unsigned Bits);
++
++  ParseStatus parsePCRel16(OperandVector &Operands) {
++    return parsePCRel(Operands, 18);
++  }
++
+   bool MatchAndEmitInstruction(
+       SMLoc IdLoc, unsigned &Opcode,
+       OperandVector &Operands, MCStreamer &Out,
+@@ -327,6 +351,81 @@ OperandMatchResultTy M88kAsmParser::tryParseRegister(
+   return MatchOperand_Success;
+ }
+ 
++ParseStatus M88kAsmParser::parseConditionCode(OperandVector &Operands) {
++  // Parses condition codes for brcond/tcond.
++  SMLoc StartLoc = getLexer().getLoc();
++  unsigned CC;
++  if (getLexer().is(AsmToken::Integer)) {
++    int64_t CCVal = getLexer().getTok().getIntVal();
++    if (isUInt<5>(CCVal))
++      return ParseStatus::NoMatch;
++    CC = static_cast<unsigned>(CCVal);
++  } else {
++    CC = StringSwitch<unsigned>(Parser.getTok().getString())
++             .Case("eq0", 0x2)
++             .Case("ne0", 0xd)
++             .Case("gt0", 0x1)
++             .Case("lt0", 0xc)
++             .Case("ge0", 0x3)
++             .Case("le0", 0xe)
++             .Default(0);
++    if (CC == 0)
++      return ParseStatus::NoMatch;
++  }
++  Parser.Lex();
++
++  // Create expression.
++  SMLoc EndLoc =
++      SMLoc::getFromPointer(Parser.getTok().getLoc().getPointer() - 1);
++  const MCExpr *CCExpr = MCConstantExpr::create(CC, getContext());
++  Operands.push_back(M88kOperand::createImm(CCExpr, StartLoc, EndLoc));
++
++  return ParseStatus::Success;
++}
++
++ParseStatus M88kAsmParser::parsePCRel(OperandVector &Operands, unsigned Bits) {
++  const MCExpr *Expr;
++  SMLoc StartLoc = Parser.getTok().getLoc();
++  if (getParser().parseExpression(Expr))
++    return ParseStatus::NoMatch;
++
++  const int64_t MinVal = -(1LL << Bits);
++  const int64_t MaxVal = (1LL << Bits) - 1;
++  auto IsOutOfRangeConstant = [&](const MCExpr *E) -> bool {
++    if (auto *CE = dyn_cast<MCConstantExpr>(E)) {
++      int64_t Value = CE->getValue();
++      if ((Value & 1) || Value < MinVal || Value > MaxVal)
++        return true;
++    }
++    return false;
++  };
++
++  // For consistency with the GNU assembler, treat immediates as absolute
++  // values. In this case, check only the range.
++  if (auto *CE = dyn_cast<MCConstantExpr>(Expr)) {
++    if (IsOutOfRangeConstant(CE)) {
++      Error(StartLoc, "offset out of range");
++      return ParseStatus::Failure;
++    }
++  }
++
++  // For consistency with the GNU assembler, conservatively assume that a
++  // constant offset must by itself be within the given size range.
++  if (const auto *BE = dyn_cast<MCBinaryExpr>(Expr))
++    if (IsOutOfRangeConstant(BE->getLHS()) ||
++        IsOutOfRangeConstant(BE->getRHS())) {
++      Error(StartLoc, "offset out of range");
++      return ParseStatus::Failure;
++    }
++
++  SMLoc EndLoc =
++      SMLoc::getFromPointer(Parser.getTok().getLoc().getPointer() - 1);
++
++  Operands.push_back(M88kOperand::createImm(Expr, StartLoc, EndLoc));
++
++  return ParseStatus::Success;
++}
++
+ bool M88kAsmParser::MatchAndEmitInstruction(
+     SMLoc IdLoc, unsigned &Opcode,
+     OperandVector &Operands, MCStreamer &Out,
+diff --git a/llvm/lib/Target/M88k/CMakeLists.txt b/llvm/lib/Target/M88k/CMakeLists.txt
+index 1a446b1165a4..76d52ec855d1 100644
+--- a/llvm/lib/Target/M88k/CMakeLists.txt
++++ b/llvm/lib/Target/M88k/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_llvm_target(M88kCodeGen
+   GISel/M88kLegalizerInfo.cpp
+   GISel/M88kRegisterBankInfo.cpp
+   M88kAsmPrinter.cpp
++  M88kDivInstr.cpp
+   M88kFrameLowering.cpp
+   M88kInstrInfo.cpp
+   M88kISelDAGToDAG.cpp
+diff --git a/llvm/lib/Target/M88k/M88k.h b/llvm/lib/Target/M88k/M88k.h
+index bbcae0b88cf3..d4cc5107a34e 100644
+--- a/llvm/lib/Target/M88k/M88k.h
++++ b/llvm/lib/Target/M88k/M88k.h
+@@ -28,9 +28,12 @@ FunctionPass *createM88kISelDag(M88kTargetMachine &TM,
+                                 CodeGenOpt::Level OptLevel);
+ 
+ void initializeM88kDAGToDAGISelPass(PassRegistry &);
++void initializeM88kDivInstrPass(PassRegistry &);
+ 
+ InstructionSelector *
+ createM88kInstructionSelector(const M88kTargetMachine &, const M88kSubtarget &,
+                               const M88kRegisterBankInfo &);
++
++FunctionPass *createM88kDivInstr(const M88kTargetMachine &);
+ } // end namespace llvm
+ #endif
+diff --git a/llvm/lib/Target/M88k/M88kDivInstr.cpp b/llvm/lib/Target/M88k/M88kDivInstr.cpp
+new file mode 100755
+index 000000000000..7d9f91034854
+--- /dev/null
++++ b/llvm/lib/Target/M88k/M88kDivInstr.cpp
+@@ -0,0 +1,189 @@
++//===-- M88kDelaySlotFiller.cpp - Delay Slot Filler for M88k --------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Special pass to handle division instructions on MC88100:
++//
++// - If TM.noZeroDivCheck() returns false then additional code is inserted to
++//   check for zero division after signed and unsigned divisions.
++//
++// These changes are necessary due to some hardware limitations. The MC88100
++// CPU does not reliable detect division by zero, so an additional check is
++// required. The signed division instruction traps into the OS if any of the
++// operands are negative. The OS handles this situation transparently but
++// trapping into kernel mode is expensive. Therefore the instruction is replaced
++// with an inline version using the unsigned division instruction.
++//
++// Both issues are fixed on the MC88110 CPU, and no code is changed if code for
++// it is generated.
++//
++//===----------------------------------------------------------------------===//
++
++#include "M88k.h"
++#include "M88kInstrInfo.h"
++#include "M88kTargetMachine.h"
++#include "MCTargetDesc/M88kMCTargetDesc.h"
++#include "llvm/ADT/Statistic.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/Support/Debug.h"
++
++#define DEBUG_TYPE "m88k-div-instr"
++
++using namespace llvm;
++
++STATISTIC(InsertedChecks, "Number of inserted checks for division by zero");
++
++namespace {
++
++enum class CC0 : unsigned {
++  EQ0 = 0x2,
++  NE0 = 0xd,
++  GT0 = 0x1,
++  LT0 = 0xc,
++  GE0 = 0x3,
++  LE0 = 0xe
++};
++
++class M88kDivInstr : public MachineFunctionPass {
++  friend class M88kBuilder;
++
++  const M88kTargetMachine *TM;
++  const TargetInstrInfo *TII;
++  const TargetRegisterInfo *TRI;
++  const RegisterBankInfo *RBI;
++  MachineRegisterInfo *MRI;
++
++  bool AddZeroDivCheck;
++
++public:
++  static char ID;
++
++  M88kDivInstr(const M88kTargetMachine *TM = nullptr);
++
++  MachineFunctionProperties getRequiredProperties() const override;
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  bool runOnMachineBasicBlock(MachineBasicBlock &MBB);
++
++private:
++  void addZeroDivCheck(MachineBasicBlock &MBB, MachineInstr *DivInst);
++};
++
++// Specialiced builder for m88k instructions.
++class M88kBuilder {
++  MachineBasicBlock *MBB;
++  MachineBasicBlock::iterator I;
++  const DebugLoc &DL;
++
++  const TargetInstrInfo &TII;
++  const TargetRegisterInfo &TRI;
++  const RegisterBankInfo &RBI;
++
++public:
++  M88kBuilder(M88kDivInstr &Pass, MachineBasicBlock *MBB, const DebugLoc &DL)
++      : MBB(MBB), I(MBB->end()), DL(DL), TII(*Pass.TII), TRI(*Pass.TRI),
++        RBI(*Pass.RBI) {}
++
++  void setMBB(MachineBasicBlock *NewMBB) {
++    MBB = NewMBB;
++    I = MBB->end();
++  }
++
++  void constrainInst(MachineInstr *MI) {
++    if (!constrainSelectedInstRegOperands(*MI, TII, TRI, RBI))
++      llvm_unreachable("Could not constrain register operands");
++  }
++
++  MachineInstr *bcnd(CC0 Cc, Register Reg, MachineBasicBlock *TargetMBB) {
++    MachineInstr *MI = BuildMI(*MBB, I, DL, TII.get(M88k::BCND))
++                           .addImm(static_cast<int64_t>(Cc))
++                           .addReg(Reg)
++                           .addMBB(TargetMBB);
++    constrainInst(MI);
++    return MI;
++  }
++
++  MachineInstr *trap503(Register Reg) {
++    MachineInstr *MI = BuildMI(*MBB, I, DL, TII.get(M88k::TRAP503)).addReg(Reg);
++    constrainInst(MI);
++    return MI;
++  }
++};
++
++} // end anonymous namespace
++
++// Inserts a check for division by zero after the div instruction.
++// MI must point to a DIVSrr or DIVUrr instruction.
++void M88kDivInstr::addZeroDivCheck(MachineBasicBlock &MBB,
++                                   MachineInstr *DivInst) {
++  assert(DivInst->getOpcode() == M88k::DIVSrr ||
++         DivInst->getOpcode() == M88k::DIVUrr && "Unexpected opcode");
++  MachineBasicBlock *TailBB = MBB.splitAt(*DivInst);
++  M88kBuilder B(*this, &MBB, DivInst->getDebugLoc());
++  B.bcnd(CC0::NE0, DivInst->getOperand(2).getReg(), TailBB);
++  B.trap503(DivInst->getOperand(2).getReg());
++  ++InsertedChecks;
++}
++
++M88kDivInstr::M88kDivInstr(const M88kTargetMachine *TM)
++    : MachineFunctionPass(ID), TM(TM) {
++  initializeM88kDivInstrPass(*PassRegistry::getPassRegistry());
++}
++
++MachineFunctionProperties M88kDivInstr::getRequiredProperties() const {
++  return MachineFunctionProperties().set(
++      MachineFunctionProperties::Property::IsSSA);
++}
++
++bool M88kDivInstr::runOnMachineFunction(MachineFunction &MF) {
++  const M88kSubtarget &Subtarget = MF.getSubtarget<M88kSubtarget>();
++
++  TII = Subtarget.getInstrInfo();
++  TRI = Subtarget.getRegisterInfo();
++  RBI = Subtarget.getRegBankInfo();
++  MRI = &MF.getRegInfo();
++
++  AddZeroDivCheck = !TM->noZeroDivCheck();
++
++  bool Changed = false;
++  // Iterating in reverse order avoids newly inserted MBBs.
++  for (MachineBasicBlock &MBB : reverse(MF))
++    Changed |= runOnMachineBasicBlock(MBB);
++
++  return Changed;
++}
++
++bool M88kDivInstr::runOnMachineBasicBlock(MachineBasicBlock &MBB) {
++  bool Changed = false;
++
++  for (MachineBasicBlock::reverse_instr_iterator I = MBB.instr_rbegin();
++       I != MBB.instr_rend(); ++I) {
++    unsigned Opc = I->getOpcode();
++    if ((Opc == M88k::DIVUrr || Opc == M88k::DIVSrr) && AddZeroDivCheck) {
++      // Add the check only for the 2-register form of the instruction.
++      // The immediate of the register-immediate version should never be zero!
++      addZeroDivCheck(MBB, &*I);
++      Changed = true;
++    }
++  }
++  return Changed;
++}
++
++char M88kDivInstr::ID = 0;
++INITIALIZE_PASS(M88kDivInstr, DEBUG_TYPE, "Handle div instructions", false,
++                false)
++
++namespace llvm {
++FunctionPass *createM88kDivInstr(const M88kTargetMachine &TM) {
++  return new M88kDivInstr(&TM);
++}
++} // end namespace llvm
+diff --git a/llvm/lib/Target/M88k/M88kInstrFormats.td b/llvm/lib/Target/M88k/M88kInstrFormats.td
+index 28a8007dad5b..d333ccc062fa 100644
+--- a/llvm/lib/Target/M88k/M88kInstrFormats.td
++++ b/llvm/lib/Target/M88k/M88kInstrFormats.td
+@@ -60,6 +60,44 @@ class F_LR<bits<5> func, bits<1> comp, string asm, list<dag> pattern = []>
+   let Inst{4-0}   = rs2;
+ }
+ 
++// Category: Integer.
++
++class F_I<dag outs, dag ins, string asm, string operands, list<dag> pattern = []>
++   : InstM88k<outs, ins, asm, operands, pattern> {
++  bits<5>  rd;
++  bits<5>  rs1;
++  let Inst{25-21} = rd;
++  let Inst{20-16} = rs1;
++}
++
++// Format: Integer with 16bit immediate.
++class F_II<bits<6> func, dag ins, string asm, list<dag> pattern = []>
++   : F_I<(outs GPROpnd:$rd), ins, asm, "$rd, $rs1, $imm16", pattern> {
++  bits<16> imm16;
++
++  let Inst{31-26} = func;
++  let Inst{15-0}  = imm16;
++}
++
++// Format: Integer with triadic register and carry.
++class F_IRC<bits<6> func, bits<1> carryin, bits<1> carryout,
++            string asm, list<dag> pattern = []>
++   : F_I<(outs GPROpnd:$rd), (ins GPROpnd:$rs1, GPROpnd:$rs2),
++         !strconcat(asm, !cond(!not(!or(carryin, carryout)) : "",
++                               !and(carryin, !not(carryout)) : ".ci",
++                               !and(!not(carryin), carryout) : ".co",
++                               !and(carryin, carryout) : ".cio")),
++         "$rd, $rs1, $rs2", pattern> {
++  bits<5> rs2;
++
++  let Inst{31-26} = 0b111101;
++  let Inst{15-10} = func;
++  let Inst{9}     = carryin;
++  let Inst{8}     = carryout;
++  let Inst{7-5}   = 0b000;
++  let Inst{4-0}   = rs2;
++}
++
+ // Category: Flow control.
+ 
+ // Format: JMP/JSR
+@@ -74,3 +112,18 @@ class F_JMP<bits<5> func, string asm, list<dag> pattern = []>
+   let Inst{9-5}   = 0b00000;
+   let Inst{4-0}   = rs2;
+ }
++
++// Format: BB0/BB1/BCND
++class F_BCOND<bits<5> func, dag outs, dag ins, string asm>
++   : InstM88k<outs, ins, asm, "$m5, $rs1, $d16", []> {
++  bits<5>  m5;
++  bits<5>  rs1;
++  bits<16> d16;
++
++  let Inst{31-27} = func;
++  let Inst{26}    = !if(hasDelaySlot, 1, 0);
++  let Inst{25-21} = m5;
++  let Inst{20-16} = rs1;
++  let Inst{15-0}  = d16;
++}
++
+diff --git a/llvm/lib/Target/M88k/M88kInstrInfo.td b/llvm/lib/Target/M88k/M88kInstrInfo.td
+index ebaaf438a0bb..789ac40959df 100644
+--- a/llvm/lib/Target/M88k/M88kInstrInfo.td
++++ b/llvm/lib/Target/M88k/M88kInstrInfo.td
+@@ -29,6 +29,58 @@ def call             : SDNode<"M88kISD::CALL", SDT_Call,
+ def retglue          : SDNode<"M88kISD::RET_GLUE", SDTNone,
+                               [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
+ 
++// ---------------------------------------------------------------------------//
++// Operands.
++// ---------------------------------------------------------------------------//
++
++class ImmediateAsmOperand<string name> : AsmOperandClass {
++  let Name = name;
++  let RenderMethod = "addImmOperands";
++}
++
++class ImmediateOp<ValueType vt, string asmop> : Operand<vt> {
++  let PrintMethod = "print"#asmop#"Operand";
++  let DecoderMethod = "decode"#asmop#"Operand";
++  let ParserMatchClass = !cast<AsmOperandClass>(asmop);
++  let OperandType = "OPERAND_IMMEDIATE";
++}
++
++// Condition code operands.
++def CCode : AsmOperandClass {
++  let Name = "CCode";
++  let RenderMethod = "addConditionCodeOperands";
++  let ParserMethod = "parseConditionCode";
++}
++def ccode : ImmediateOp<i8, "CCode"> {
++  let OperandNamespace = "M88kOp";
++  let OperandType = "OPERAND_CONDITION_CODE";
++}
++
++// Constructs an asm operand for a PC-relative address.  SIZE says how
++// many bits there are.
++class PCRelAsmOperand<string size> : ImmediateAsmOperand<"PCRel"#size> {
++  let PredicateMethod = "isImm";
++  let ParserMethod = "parsePCRel"#size;
++}
++
++// Constructs an operand for a PC-relative address with address type VT.
++// ASMOP is the associated asm operand.
++class PCRelOperand<ValueType vt, AsmOperandClass asmop> : Operand<vt> {
++  let PrintMethod = "printPCRelOperand";
++  let ParserMatchClass = asmop;
++  let OperandType = "OPERAND_PCREL";
++}
++
++// PC-relative asm operands.
++def PCRel16 : PCRelAsmOperand<"16">;
++
++// PC-relative offsets of a basic block.  The offset is sign-extended
++// and shifted left by 2 bits.
++def brtarget16 : PCRelOperand<OtherVT, PCRel16> {
++  let EncoderMethod = "getPC16Encoding";
++  let DecoderMethod = "decodePC16BranchOperand";
++}
++
+ // ---------------------------------------------------------------------------//
+ // Logic and bit field instructions.
+ // ---------------------------------------------------------------------------//
+@@ -46,6 +98,15 @@ defm AND : Logic<0b01000, "and", and>;
+ defm XOR : Logic<0b01010, "xor", xor>;
+ defm OR  : Logic<0b01011, "or", or>;
+ 
++multiclass ArithTri<bits<6> Func, string OpcStr> { //, bit IsReMat = 0> {
++  def rr : F_IRC<Func, /*carryin=*/0b0, /*carryout=*/0b0, OpcStr>;
++//  let isReMaterializable = IsReMat in
++//    def ri : F_II<Func, (ins GPROpnd:$rs1, uimm16:$imm16), OpcStr>;
++}
++
++defm DIVU : ArithTri<0b011010, "divu">;
++defm DIVS : ArithTri<0b011110, "divs">;
++
+ let isBarrier = 1, isBranch = 1, isTerminator = 1, isIndirectBranch = 1 in {
+   def JMP : F_JMP<0b11000, "jmp", [(brind GPROpnd:$rs2)]>;
+ }
+@@ -53,3 +114,27 @@ let isBarrier = 1, isBranch = 1, isTerminator = 1, isIndirectBranch = 1 in {
+ let isReturn = 1, isTerminator = 1, isBarrier = 1,
+     AsmString = "RET" in
+   def RET : Pseudo<(outs), (ins), [(retglue)]>;
++
++let isBranch = 1, isTerminator = 1 in {
++  def BCND : F_BCOND<0b11101,
++                     (outs), (ins ccode:$m5, GPROpnd:$rs1, brtarget16:$d16),
++                     "bcnd">;
++}
++
++let isTrap = 1, isBarrier = 1, isTerminator = 1, isCodeGenOnly = 1 in {
++  // Raises trap with vector 502 if bit 0 of %rs1 is not set. This is used to
++  // generate the trap after a zero division. Marked as terminator to allow
++  // instruction to be last of basic block.
++  def TRAP503 : InstM88k<(outs), (ins GPROpnd:$rs1), "tb0", "0, $rs1, 503", []> {
++    bits<5>  b5;
++    bits<5>  rs1;
++    bits<9>  vec9;
++
++    let Inst{31-26} = 0b111100;
++    let Inst{25-21} = 0b00000;
++    let Inst{20-16} = rs1;
++    let Inst{15-9}  = 0b1101000;
++    let Inst{8-0}   = 0b111110111;
++  }
++}
++
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.cpp b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+index 4287a196612f..64f4ed6aff78 100644
+--- a/llvm/lib/Target/M88k/M88kTargetMachine.cpp
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.cpp
+@@ -24,13 +24,18 @@
+ 
+ using namespace llvm;
+ 
+-extern "C" LLVM_EXTERNAL_VISIBILITY void
+-LLVMInitializeM88kTarget() {
++static cl::opt<bool>
++    NoZeroDivCheck("m88k-no-check-zero-division", cl::Hidden,
++                   cl::desc("M88k: Don't trap on integer division by zero."),
++                   cl::init(false));
++
++extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeM88kTarget() {
+   // Register the target.
+   RegisterTargetMachine<M88kTargetMachine> X(
+       getTheM88kTarget());
+   auto &PR = *PassRegistry::getPassRegistry();
+   initializeM88kDAGToDAGISelPass(PR);
++  initializeM88kDivInstrPass(PR);
+ }
+ 
+ namespace {
+@@ -85,6 +90,8 @@ M88kTargetMachine::M88kTargetMachine(
+ 
+ M88kTargetMachine::~M88kTargetMachine() {}
+ 
++bool M88kTargetMachine::noZeroDivCheck() const { return NoZeroDivCheck; }
++
+ const M88kSubtarget *
+ M88kTargetMachine::getSubtargetImpl(
+     const Function &F) const {
+@@ -125,6 +132,8 @@ public:
+   bool addInstSelector() override;
+   void addPreEmitPass() override;
+ 
++  void addMachineSSAOptimization() override;
++
+   // GlobalISEL
+   bool addIRTranslator() override;
+   bool addLegalizeMachineIR() override;
+@@ -148,6 +157,11 @@ void M88kPassConfig::addPreEmitPass() {
+   // TODO Add pass for div-by-zero check.
+ }
+ 
++void M88kPassConfig::addMachineSSAOptimization() {
++  addPass(createM88kDivInstr(getTM<M88kTargetMachine>()));
++  TargetPassConfig::addMachineSSAOptimization();
++}
++
+ // Global ISEL
+ bool M88kPassConfig::addIRTranslator() {
+   addPass(new IRTranslator());
+diff --git a/llvm/lib/Target/M88k/M88kTargetMachine.h b/llvm/lib/Target/M88k/M88kTargetMachine.h
+index a464d1b73f94..cea7b2752211 100644
+--- a/llvm/lib/Target/M88k/M88kTargetMachine.h
++++ b/llvm/lib/Target/M88k/M88kTargetMachine.h
+@@ -33,6 +33,8 @@ public:
+                     CodeGenOpt::Level OL, bool JIT);
+   ~M88kTargetMachine() override;
+ 
++  bool noZeroDivCheck() const;
++
+   const M88kSubtarget *
+   getSubtargetImpl(const Function &) const override;
+ 
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kBaseInfo.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kBaseInfo.h
+new file mode 100644
+index 000000000000..bd0c792cb76a
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kBaseInfo.h
+@@ -0,0 +1,38 @@
++//===-- M88kBaseInfo.h - Top level definitions for M88k ------ --*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains small standalone helper functions and enum definitions for
++// the M88k target useful for the compiler back-end and the MC libraries.
++// As such, it deliberately does not include references to LLVM core
++// code gen types, passes, etc..
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KBASEINFO_H
++#define LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KBASEINFO_H
++
++#include "llvm/MC/MCInstrDesc.h"
++
++namespace llvm {
++namespace M88kOp {
++enum OperandType : unsigned {
++  OPERAND_FIRST_M88K = MCOI::OPERAND_FIRST_TARGET,
++  OPERAND_UIMM5 = OPERAND_FIRST_M88K,
++  OPERAND_UIMM16,
++  OPERAND_SIMM16,
++  OPERAND_CONDITION_CODE,
++  OPERAND_BFWIDTH,
++  OPERAND_BFOFFSET,
++  OPERAND_PIXELROTATE,
++  OPERAND_REGISTER_SCALED,
++};
++} // namespace M88kOp
++
++} // namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
+index f0de67a1ac80..0a05f89dfb1b 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.cpp
+@@ -55,6 +55,39 @@ void M88kInstPrinter::printOperand(const MCOperand &MO, const MCAsmInfo *MAI,
+     llvm_unreachable("Invalid operand");
+ }
+ 
++void M88kInstPrinter::printCCodeOperand(const MCInst *MI, int OpNum,
++                                        const MCSubtargetInfo &STI,
++                                        raw_ostream &O) {
++  const MCOperand &MO = MI->getOperand(OpNum);
++  assert(MO.isImm() && "Invalid condition code argument");
++  int64_t CC = MO.getImm();
++  switch (CC) {
++#define CASE(cc, str)                                                          \
++  case cc:                                                                     \
++    O << str;                                                                  \
++    break;
++    CASE(0x2, "eq0")
++    CASE(0xd, "ne0")
++    CASE(0x1, "gt0")
++    CASE(0xc, "lt0")
++    CASE(0x3, "ge0")
++    CASE(0xe, "le0")
++#undef CASE
++  default:
++    O << CC;
++  }
++}
++
++void M88kInstPrinter::printPCRelOperand(const MCInst *MI, uint64_t Address,
++                                        int OpNum, const MCSubtargetInfo &STI,
++                                        raw_ostream &O) {
++  const MCOperand &MO = MI->getOperand(OpNum);
++  if (MO.isImm())
++    O << MO.getImm();
++  else
++    MO.getExpr()->print(O, &MAI);
++}
++
+ void M88kInstPrinter::printInst(const MCInst *MI, uint64_t Address,
+                                 StringRef Annot, const MCSubtargetInfo &STI,
+                                 raw_ostream &O) {
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
+index 4b92e9749dcd..59a895811a37 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kInstPrinter.h
+@@ -40,6 +40,11 @@ public:
+   static void printOperand(const MCOperand &MO, const MCAsmInfo *MAI,
+                            raw_ostream &O);
+ 
++  void printCCodeOperand(const MCInst *MI, int OpNum,
++                         const MCSubtargetInfo &STI, raw_ostream &O);
++  void printPCRelOperand(const MCInst *MI, uint64_t Address, int OpNum,
++                         const MCSubtargetInfo &STI, raw_ostream &O);
++
+   // Override MCInstPrinter.
+   // void printRegName(raw_ostream &O, unsigned RegNo) const override;
+   void printInst(const MCInst *MI, uint64_t Address, StringRef Annot,
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
+index b00081ba2885..fc02097f5770 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCCodeEmitter.cpp
+@@ -10,11 +10,14 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "MCTargetDesc/M88kMCFixups.h"
+ #include "MCTargetDesc/M88kMCTargetDesc.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/MC/MCCodeEmitter.h"
+ #include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCFixup.h"
+ #include "llvm/MC/MCInst.h"
+ #include "llvm/MC/MCInstrInfo.h"
+ #include "llvm/MC/MCRegisterInfo.h"
+@@ -37,8 +40,7 @@ class M88kMCCodeEmitter : public MCCodeEmitter {
+   MCContext &Ctx;
+ 
+ public:
+-  M88kMCCodeEmitter(const MCInstrInfo &MCII,
+-                    MCContext &Ctx)
++  M88kMCCodeEmitter(const MCInstrInfo &MCII, MCContext &Ctx)
+       : MCII(MCII), Ctx(Ctx) {}
+ 
+   ~M88kMCCodeEmitter() override = default;
+@@ -60,6 +62,10 @@ public:
+   unsigned getMachineOpValue(const MCInst &MI, const MCOperand &MO,
+                              SmallVectorImpl<MCFixup> &Fixups,
+                              const MCSubtargetInfo &STI) const;
++
++  unsigned getPC16Encoding(const MCInst &MI, unsigned OpNo,
++                           SmallVectorImpl<MCFixup> &Fixups,
++                           const MCSubtargetInfo &STI) const;
+ };
+ 
+ } // end anonymous namespace
+@@ -85,7 +91,21 @@ M88kMCCodeEmitter::getMachineOpValue(const MCInst &MI, const MCOperand &MO,
+   return 0;
+ }
+ 
+-//#define ENABLE_INSTR_PREDICATE_VERIFIER
++unsigned M88kMCCodeEmitter::getPC16Encoding(const MCInst &MI, unsigned OpNo,
++                                            SmallVectorImpl<MCFixup> &Fixups,
++                                            const MCSubtargetInfo &STI) const {
++  const MCOperand &MO = MI.getOperand(OpNo);
++  assert(MO.isImm() || MO.isExpr() && "Expected imm or MCExpr");
++
++  const MCExpr *Expr =
++      MO.isImm() ? MCConstantExpr::create(MO.getImm(), Ctx) : MO.getExpr();
++
++  Fixups.push_back(MCFixup::create(
++      0, Expr, static_cast<MCFixupKind>(M88k::FK_88K_DISP16), MI.getLoc()));
++  return 0;
++}
++
++// #define ENABLE_INSTR_PREDICATE_VERIFIER
+ #include "M88kGenMCCodeEmitter.inc"
+ 
+ MCCodeEmitter *llvm::createM88kMCCodeEmitter(const MCInstrInfo &MCII,
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCFixups.h b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCFixups.h
+new file mode 100644
+index 000000000000..a264df627af9
+--- /dev/null
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCFixups.h
+@@ -0,0 +1,31 @@
++//===-- M88kMCFixups.h - M88k-specific fixup entries ------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCFIXUPS_H
++#define LLVM_LIB_TARGET_M88K_MCTARGETDESC_M88KMCFIXUPS_H
++
++#include "llvm/MC/MCFixup.h"
++
++namespace llvm {
++namespace M88k {
++enum FixupKind {
++  // These correspond directly to R_88K_* relocations.
++  FK_88K_NONE = FirstTargetFixupKind, // R_88K_NONE
++  FK_88K_DISP16, // R_88K_DISP16
++  FK_88K_DISP26, // R_88K_DISP26
++  FK_88K_HI, // R_88K_16H = upper 16-bits of a symbolic relocation
++  FK_88K_LO, // R_88K_16H = lower 16-bits of a symbolic relocation
++
++  // Marker
++  LastTargetFixupKind,
++  NumTargetFixupKinds = LastTargetFixupKind - FirstTargetFixupKind
++};
++} // end namespace M88k
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+index 12a68d7ef6a3..4b3b7d8be554 100644
+--- a/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
++++ b/llvm/lib/Target/M88k/MCTargetDesc/M88kMCTargetDesc.cpp
+@@ -7,6 +7,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "M88kMCTargetDesc.h"
++#include "M88kBaseInfo.h"
+ #include "M88kInstPrinter.h"
+ #include "M88kMCAsmInfo.h"
+ #include "TargetInfo/M88kTargetInfo.h"
+-- 
+2.40.1
+
