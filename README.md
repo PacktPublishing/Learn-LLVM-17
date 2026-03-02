@@ -1,3 +1,5 @@
+<p align='center'><a href='https://www.eventbrite.com/e/ship-production-pytorch-system-in-a-day-train-optimize-deploy-workshop-tickets-1983348934052?aff=GitHub'><img src='https://static.packt-cdn.com/assets/images/packt+events/workshop_ashish_github.png'/></a></p>
+
 # Learn LLVM 17
 
 <a href="https://www.packtpub.com/product/learn-llvm-17-second-edition/9781837631346?utm_source=github&utm_medium=repository&utm_campaign=9781837631346"><img src="https://m.media-amazon.com/images/I/71JS1fL+SkL._SL1500_.jpg" alt="Learn LLVM 17" height="256px" align="right"></a>
